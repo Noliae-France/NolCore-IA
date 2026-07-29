@@ -1,0 +1,509 @@
+// Bibliothèque cryptographique de base en pur Nolc.
+// Copyright Bastien LANGUEDOC.
+//
+// Contenu :
+// - hex : hex_encode / hex_decode
+// - base64 : base64_encode / base64_decode (standard, padding "=")
+// - SHA-1 : sha1 / sha1_hex (compatibilité protocoles : WebSocket, Git)
+// - SHA-256 : sha256 / sha256_hex (RFC 6234)
+// - HMAC-SHA256 : hmac_sha256 / hmac_sha256_hex (RFC 2104)
+// - aléatoire : random_bytes / random_hex (via /dev/urandom)
+// - comparaison en temps constant : bytes_egal_ct
+//
+// SHA-256 travaille en arithmétique modulo 2^32. Comme Int est 64 bits, on
+// additionne puis on masque avec bit_and(x, 4294967295) (0xFFFFFFFF) pour
+// rester dans 32 bits sans jamais déborder les 64 bits.
+
+// ------------------- Hexadécimal -------------------
+
+fn hex_chiffre(v: Int) -> Text {
+    let table = "0123456789abcdef"
+    return char_at(table, bit_and(v, 15))
+}
+
+fn hex_encode(b: Bytes) -> Text {
+    var out = ""
+    var i = 0
+    while i < len(b) {
+        let octet = bytes_get(b, i)
+        out = out + hex_chiffre(bit_shr(octet, 4))
+        out = out + hex_chiffre(octet)
+        i = i + 1
+    }
+    return out
+}
+
+// Valeur d'un caractère hexa, ou none si non hexadécimal.
+fn hex_valeur(c: Int) -> Option<Int> {
+    if c >= 48 and c <= 57 {
+        return some(c - 48)
+    }
+    if c >= 97 and c <= 102 {
+        return some(c - 87)
+    }
+    if c >= 65 and c <= 70 {
+        return some(c - 55)
+    }
+    return none
+}
+
+fn hex_decode(t: Text) -> Option<Bytes> {
+    let src = bytes_from_text(t)
+    let n = len(src)
+    if n % 2 != 0 {
+        return none
+    }
+    var out = bytes_new()
+    var i = 0
+    while i < n {
+        let haut = hex_valeur(bytes_get(src, i))
+        let bas = hex_valeur(bytes_get(src, i + 1))
+        if not has(haut) or not has(bas) {
+            return none
+        }
+        bytes_push(out, bit_or(bit_shl(unwrap_or(haut, 0), 4), unwrap_or(bas, 0)))
+        i = i + 2
+    }
+    return some(out)
+}
+
+// ------------------- Base64 -------------------
+
+fn b64_alphabet() -> Text {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+fn base64_encode(b: Bytes) -> Text {
+    let alpha = b64_alphabet()
+    let n = len(b)
+    var out = ""
+    var i = 0
+    while i < n {
+        let reste = n - i
+        let o0 = bytes_get(b, i)
+        var o1 = 0
+        var o2 = 0
+        if reste > 1 {
+            o1 = bytes_get(b, i + 1)
+        }
+        if reste > 2 {
+            o2 = bytes_get(b, i + 2)
+        }
+        let bloc = bit_or(bit_or(bit_shl(o0, 16), bit_shl(o1, 8)), o2)
+        out = out + char_at(alpha, bit_and(bit_shr(bloc, 18), 63))
+        out = out + char_at(alpha, bit_and(bit_shr(bloc, 12), 63))
+        if reste > 1 {
+            out = out + char_at(alpha, bit_and(bit_shr(bloc, 6), 63))
+        } else {
+            out = out + "="
+        }
+        if reste > 2 {
+            out = out + char_at(alpha, bit_and(bloc, 63))
+        } else {
+            out = out + "="
+        }
+        i = i + 3
+    }
+    return out
+}
+
+// Valeur d'un caractère base64, ou none si hors alphabet.
+fn b64_valeur(c: Int) -> Option<Int> {
+    if c >= 65 and c <= 90 {
+        return some(c - 65)
+    }
+    if c >= 97 and c <= 122 {
+        return some(c - 71)
+    }
+    if c >= 48 and c <= 57 {
+        return some(c + 4)
+    }
+    if c == 43 {
+        return some(62)
+    }
+    if c == 47 {
+        return some(63)
+    }
+    return none
+}
+
+fn base64_decode(t: Text) -> Option<Bytes> {
+    let src = bytes_from_text(t)
+    let n = len(src)
+    if n % 4 != 0 {
+        return none
+    }
+    var out = bytes_new()
+    if n == 0 {
+        return some(out)
+    }
+    var i = 0
+    while i < n {
+        let c0 = bytes_get(src, i)
+        let c1 = bytes_get(src, i + 1)
+        let c2 = bytes_get(src, i + 2)
+        let c3 = bytes_get(src, i + 3)
+        let v0 = b64_valeur(c0)
+        let v1 = b64_valeur(c1)
+        if not has(v0) or not has(v1) {
+            return none
+        }
+        // Le padding "=" (61) n'est autorisé que sur les deux derniers
+        // caractères du dernier bloc.
+        let dernier = i + 4 == n
+        var pad2 = false
+        var pad3 = false
+        if c2 == 61 {
+            if not dernier {
+                return none
+            }
+            pad2 = true
+        }
+        if c3 == 61 {
+            if not dernier {
+                return none
+            }
+            pad3 = true
+        }
+        // "=X" (pad2 sans pad3) est invalide.
+        if pad2 and not pad3 {
+            return none
+        }
+        var w2 = 0
+        var w3 = 0
+        if not pad2 {
+            if not has(b64_valeur(c2)) {
+                return none
+            }
+            w2 = unwrap_or(b64_valeur(c2), 0)
+        }
+        if not pad3 {
+            if not has(b64_valeur(c3)) {
+                return none
+            }
+            w3 = unwrap_or(b64_valeur(c3), 0)
+        }
+        let bloc = bit_or(bit_or(bit_or(bit_shl(unwrap_or(v0, 0), 18), bit_shl(unwrap_or(v1, 0), 12)), bit_shl(w2, 6)), w3)
+        bytes_push(out, bit_and(bit_shr(bloc, 16), 255))
+        if not pad2 {
+            bytes_push(out, bit_and(bit_shr(bloc, 8), 255))
+        }
+        if not pad3 {
+            bytes_push(out, bit_and(bloc, 255))
+        }
+        i = i + 4
+    }
+    return some(out)
+}
+
+// ------------------- SHA-256 -------------------
+
+// ------------------- SHA-1 -------------------
+// SHA-1 n'est plus recommandé pour de nouvelles signatures. Il reste requis
+// par certains protocoles historiques, notamment le handshake WebSocket
+// (`Sec-WebSocket-Accept`, RFC 6455).
+
+fn sha1_rotl(x: Int, n: Int) -> Int {
+    return bit_and(bit_or(bit_shl(x, n), bit_shr(x, 32 - n)), 4294967295)
+}
+
+fn sha1_m32(x: Int) -> Int {
+    return bit_and(x, 4294967295)
+}
+
+fn sha1_bloc(h: List<Int>, bloc: Bytes, decalage: Int) {
+    var w: List<Int> = []
+    var t = 0
+    while t < 16 {
+        let j = decalage + t * 4
+        let mot = bit_or(bit_or(bit_or(bit_shl(bytes_get(bloc, j), 24), bit_shl(bytes_get(bloc, j + 1), 16)), bit_shl(bytes_get(bloc, j + 2), 8)), bytes_get(bloc, j + 3))
+        push(w, mot)
+        t = t + 1
+    }
+    while t < 80 {
+        push(w, sha1_rotl(bit_xor(bit_xor(bit_xor(get(w, t - 3), get(w, t - 8)), get(w, t - 14)), get(w, t - 16)), 1))
+        t = t + 1
+    }
+
+    var a = get(h, 0)
+    var b = get(h, 1)
+    var c = get(h, 2)
+    var d = get(h, 3)
+    var e = get(h, 4)
+    t = 0
+    while t < 80 {
+        var f = 0
+        var k = 0
+        if t < 20 {
+            f = bit_or(bit_and(b, c), bit_and(bit_not(b), d))
+            k = 1518500249
+        } else if t < 40 {
+            f = bit_xor(bit_xor(b, c), d)
+            k = 1859775393
+        } else if t < 60 {
+            f = bit_or(bit_or(bit_and(b, c), bit_and(b, d)), bit_and(c, d))
+            k = 2400959708
+        } else {
+            f = bit_xor(bit_xor(b, c), d)
+            k = 3395469782
+        }
+        let temp = sha1_m32(sha1_rotl(a, 5) + f + e + k + get(w, t))
+        e = d
+        d = c
+        c = sha1_rotl(b, 30)
+        b = a
+        a = temp
+        t = t + 1
+    }
+
+    list_set(h, 0, sha1_m32(get(h, 0) + a))
+    list_set(h, 1, sha1_m32(get(h, 1) + b))
+    list_set(h, 2, sha1_m32(get(h, 2) + c))
+    list_set(h, 3, sha1_m32(get(h, 3) + d))
+    list_set(h, 4, sha1_m32(get(h, 4) + e))
+}
+
+fn sha1(b: Bytes) -> Bytes {
+    let taille = len(b)
+    var m = bytes_new()
+    bytes_append(m, b)
+    bytes_push(m, 128)
+    while len(m) % 64 != 56 {
+        bytes_push(m, 0)
+    }
+    let bits = taille * 8
+    var i = 0
+    while i < 8 {
+        bytes_push(m, bit_and(bit_shr(bits, (7 - i) * 8), 255))
+        i = i + 1
+    }
+
+    var h = [1732584193, 4023233417, 2562383102, 271733878, 3285377520]
+    var decalage = 0
+    while decalage < len(m) {
+        sha1_bloc(h, m, decalage)
+        decalage = decalage + 64
+    }
+
+    var out = bytes_new()
+    var w = 0
+    while w < 5 {
+        let mot = get(h, w)
+        bytes_push(out, bit_and(bit_shr(mot, 24), 255))
+        bytes_push(out, bit_and(bit_shr(mot, 16), 255))
+        bytes_push(out, bit_and(bit_shr(mot, 8), 255))
+        bytes_push(out, bit_and(mot, 255))
+        w = w + 1
+    }
+    return out
+}
+
+fn sha1_hex(b: Bytes) -> Text {
+    return hex_encode(sha1(b))
+}
+
+// Rotation droite sur 32 bits.
+fn sha_rotr(x: Int, n: Int) -> Int {
+    return bit_and(bit_or(bit_shr(x, n), bit_shl(x, 32 - n)), 4294967295)
+}
+
+// Masque 32 bits (modulo 2^32).
+fn sha_m32(x: Int) -> Int {
+    return bit_and(x, 4294967295)
+}
+
+fn sha_k() -> List<Int> {
+    return [1116352408, 1899447441, 3049323471, 3921009573, 961987163, 1508970993, 2453635748, 2870763221, 3624381080, 310598401, 607225278, 1426881987, 1925078388, 2162078206, 2614888103, 3248222580, 3835390401, 4022224774, 264347078, 604807628, 770255983, 1249150122, 1555081692, 1996064986, 2554220882, 2821834349, 2952996808, 3210313671, 3336571891, 3584528711, 113926993, 338241895, 666307205, 773529912, 1294757372, 1396182291, 1695183700, 1986661051, 2177026350, 2456956037, 2730485921, 2820302411, 3259730800, 3345764771, 3516065817, 3600352804, 4094571909, 275423344, 430227734, 506948616, 659060556, 883997877, 958139571, 1322822218, 1537002063, 1747873779, 1955562222, 2024104815, 2227730452, 2361852424, 2428436474, 2756734187, 3204031479, 3329325298]
+}
+
+fn sha_h0() -> List<Int> {
+    return [1779033703, 3144134277, 1013904242, 2773480762, 1359893119, 2600822924, 528734635, 1541459225]
+}
+
+// Traite un bloc de 64 octets à partir de « decalage » et met à jour h.
+fn sha_bloc(h: List<Int>, bloc: Bytes, decalage: Int, k: List<Int>) {
+    var w: List<Int> = []
+    var t = 0
+    while t < 16 {
+        let j = decalage + t * 4
+        let mot = bit_or(bit_or(bit_or(bit_shl(bytes_get(bloc, j), 24), bit_shl(bytes_get(bloc, j + 1), 16)), bit_shl(bytes_get(bloc, j + 2), 8)), bytes_get(bloc, j + 3))
+        push(w, mot)
+        t = t + 1
+    }
+    t = 16
+    while t < 64 {
+        let x15 = get(w, t - 15)
+        let x2 = get(w, t - 2)
+        let s0 = bit_xor(bit_xor(sha_rotr(x15, 7), sha_rotr(x15, 18)), bit_shr(x15, 3))
+        let s1 = bit_xor(bit_xor(sha_rotr(x2, 17), sha_rotr(x2, 19)), bit_shr(x2, 10))
+        push(w, sha_m32(get(w, t - 16) + s0 + get(w, t - 7) + s1))
+        t = t + 1
+    }
+    var a = get(h, 0)
+    var b = get(h, 1)
+    var c = get(h, 2)
+    var d = get(h, 3)
+    var e = get(h, 4)
+    var f = get(h, 5)
+    var g = get(h, 6)
+    var hh = get(h, 7)
+    t = 0
+    while t < 64 {
+        let ge1 = bit_xor(bit_xor(sha_rotr(e, 6), sha_rotr(e, 11)), sha_rotr(e, 25))
+        let ch = bit_xor(bit_and(e, f), bit_and(bit_not(e), g))
+        let t1 = sha_m32(hh + ge1 + ch + get(k, t) + get(w, t))
+        let ga0 = bit_xor(bit_xor(sha_rotr(a, 2), sha_rotr(a, 13)), sha_rotr(a, 22))
+        let maj = bit_xor(bit_xor(bit_and(a, b), bit_and(a, c)), bit_and(b, c))
+        let t2 = sha_m32(ga0 + maj)
+        hh = g
+        g = f
+        f = e
+        e = sha_m32(d + t1)
+        d = c
+        c = b
+        b = a
+        a = sha_m32(t1 + t2)
+        t = t + 1
+    }
+    list_set(h, 0, sha_m32(get(h, 0) + a))
+    list_set(h, 1, sha_m32(get(h, 1) + b))
+    list_set(h, 2, sha_m32(get(h, 2) + c))
+    list_set(h, 3, sha_m32(get(h, 3) + d))
+    list_set(h, 4, sha_m32(get(h, 4) + e))
+    list_set(h, 5, sha_m32(get(h, 5) + f))
+    list_set(h, 6, sha_m32(get(h, 6) + g))
+    list_set(h, 7, sha_m32(get(h, 7) + hh))
+}
+
+fn sha256(b: Bytes) -> Bytes {
+    let taille = len(b)
+    // Message rembourré : copie + 0x80 + zéros + longueur en bits (64 bits BE).
+    var m = bytes_new()
+    bytes_append(m, b)
+    bytes_push(m, 128)
+    while len(m) % 64 != 56 {
+        bytes_push(m, 0)
+    }
+    let bits = taille * 8
+    var i = 0
+    while i < 8 {
+        bytes_push(m, bit_and(bit_shr(bits, (7 - i) * 8), 255))
+        i = i + 1
+    }
+    var h = sha_h0()
+    let k = sha_k()
+    var decalage = 0
+    while decalage < len(m) {
+        sha_bloc(h, m, decalage, k)
+        decalage = decalage + 64
+    }
+    var out = bytes_new()
+    var w = 0
+    while w < 8 {
+        let mot = get(h, w)
+        bytes_push(out, bit_and(bit_shr(mot, 24), 255))
+        bytes_push(out, bit_and(bit_shr(mot, 16), 255))
+        bytes_push(out, bit_and(bit_shr(mot, 8), 255))
+        bytes_push(out, bit_and(mot, 255))
+        w = w + 1
+    }
+    return out
+}
+
+fn sha256_hex(b: Bytes) -> Text {
+    return hex_encode(sha256(b))
+}
+
+// ------------------- HMAC-SHA256 (RFC 2104) -------------------
+
+fn hmac_sha256(cle: Bytes, message: Bytes) -> Bytes {
+    let bloc_taille = 64
+    // Clé normalisée à 64 octets (hachée si trop longue, complétée de zéros).
+    var cle_norm = bytes_new()
+    if len(cle) > bloc_taille {
+        bytes_append(cle_norm, sha256(cle))
+    } else {
+        bytes_append(cle_norm, cle)
+    }
+    while len(cle_norm) < bloc_taille {
+        bytes_push(cle_norm, 0)
+    }
+    var ipad = bytes_new()
+    var opad = bytes_new()
+    var i = 0
+    while i < bloc_taille {
+        let o = bytes_get(cle_norm, i)
+        bytes_push(ipad, bit_xor(o, 54))
+        bytes_push(opad, bit_xor(o, 92))
+        i = i + 1
+    }
+    // interne = SHA-256(ipad || message)
+    var interne = bytes_new()
+    bytes_append(interne, ipad)
+    bytes_append(interne, message)
+    let h_interne = sha256(interne)
+    // externe = SHA-256(opad || interne)
+    var externe = bytes_new()
+    bytes_append(externe, opad)
+    bytes_append(externe, h_interne)
+    return sha256(externe)
+}
+
+fn hmac_sha256_hex(cle: Bytes, message: Bytes) -> Text {
+    return hex_encode(hmac_sha256(cle, message))
+}
+
+// ------------------- Aléatoire -------------------
+//
+// file_read_bytes lit jusqu'à EOF : impossible sur /dev/urandom (flux
+// infini). On extrait donc n octets via « head -c » vers un fichier
+// temporaire, puis on le relit. Retourne none si /dev/urandom est
+// indisponible ou si la lecture échoue.
+
+fn random_bytes(n: Int) -> Option<Bytes> {
+    if n <= 0 {
+        return some(bytes_new())
+    }
+    let chemin = "/tmp/nolc-rand-" + text(mono_ms()) + "-" + text(n)
+    let code = os_run("head -c " + text(n) + " /dev/urandom > " + chemin + " 2>/dev/null")
+    if not has(code) or unwrap_or(code, -1) != 0 {
+        return none
+    }
+    let lu = file_read_bytes(chemin)
+    let _efface = os_run("rm -f " + chemin)
+    if not has(lu) {
+        return none
+    }
+    let donnees = unwrap_or(lu, bytes_new())
+    if len(donnees) != n {
+        return none
+    }
+    return some(donnees)
+}
+
+fn random_hex(n: Int) -> Option<Text> {
+    let b = random_bytes(n)
+    if not has(b) {
+        return none
+    }
+    return some(hex_encode(unwrap_or(b, bytes_new())))
+}
+
+// ------------------- Comparaison en temps constant -------------------
+//
+// Parcourt toute la longueur, accumule les différences par bit_or, sans
+// court-circuit : le temps ne dépend pas de la position de la première
+// divergence. Deux tampons de tailles différentes sont toujours inégaux.
+
+fn bytes_egal_ct(a: Bytes, b: Bytes) -> Bool {
+    if len(a) != len(b) {
+        return false
+    }
+    var diff = 0
+    var i = 0
+    while i < len(a) {
+        diff = bit_or(diff, bit_xor(bytes_get(a, i), bytes_get(b, i)))
+        i = i + 1
+    }
+    return diff == 0
+}

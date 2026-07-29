@@ -1,0 +1,636 @@
+// Client HTTP/1.1 pour Nolc : GET / POST, analyse d'URL, lecture complète de
+// la reponse (Content-Length ou fermeture), suivi des redirections avec
+// garde-fou, timeout et bornes memoire anti-DoS.
+//
+// Usage : import "lib/http_client.nol" (chemin relatif au fichier qui importe).
+//
+// Copyright (c) Bastien LANGUEDOC.
+//
+// ETAT HTTPS : https:// est desormais SUPPORTE avec VALIDATION STRICTE du
+// certificat (chaine + expiration via SSL_VERIFY_PEER / SSL_get_verify_result),
+// verification du NOM D'HOTE (SAN/CN via SSL_set1_host) et SNI. Le FFI client
+// TLS vit dans lib/tls.nol (tls_client_contexte / tls_connecter), importe ici ;
+// la deduplication des symboles extern cote langage permet de cohabiter avec le
+// FFI serveur du meme module sans collision. La chaine de confiance est le
+// magasin de CA du systeme (SSL_CTX_set_default_verify_paths). Un certificat
+// invalide, expire ou dont le nom ne correspond pas => connexion REFUSEE (none),
+// jamais acceptee en aveugle. TLS 1.2 minimum.
+//
+// COMPILATION d'un programme qui fait des requetes https :// :
+// nolc build prog.nol --lien ssl --lien crypto \
+// --chemin-lib "$(brew --prefix openssl@3)/lib"   # macOS
+// nolc build prog.nol --lien ssl --lien crypto        # Linux (libssl-dev)
+// (Les requetes http:// en clair ne necessitent aucune de ces liaisons ; elles
+// ne sont requises que si le binaire final emet des requetes https.)
+//
+// LIMITE : Transfer-Encoding: chunked n'est PAS decode. Sans Content-Length, le
+// corps est lu jusqu'a fermeture de la connexion et rendu tel quel (les tailles
+// de chunk hexa restent dans le corps). TODO(chunked) : dechunker le corps.
+
+import "tls.nol"
+
+// ---------- Constantes ----------
+
+fn hc_timeout_defaut_ms() -> Int {
+    return 15000
+}
+
+// Borne dure de la taille lue (8 Mio) : evite l'epuisement memoire.
+fn hc_taille_max_defaut() -> Int {
+    return 8388608
+}
+
+// Nombre maximal de sauts de redirection suivis.
+fn hc_redirections_max() -> Int {
+    return 5
+}
+
+// ---------- Types ----------
+
+// Composants d'une URL. Champs scalaires uniquement (contrainte record).
+record UrlParties {
+    schema: Text,
+    hote: Text,
+    port: Int,
+    chemin: Text
+}
+
+// ReponseHttp cote client. Les en-tetes sont stockes en bloc brut ("Nom: Valeur"
+// separes par \r\n) et lus via reponse_entete pour garder l'ordre exact et les
+// doublons eventuels.
+record ReponseHttp {
+    statut: Int,
+    entetes: Text,
+    corps: Text
+}
+
+// ---------- Validation anti-injection ----------
+
+// Vrai si le texte contient un CR, un LF ou un caractere de controle bas :
+// blindage contre l'injection d'en-tetes (request splitting) via hote/chemin.
+fn hc_a_crlf(t: Text) -> Bool {
+    if has(find(t, "\r")) or has(find(t, "\n")) {
+        return true
+    }
+    // Tabulation et espace ne sont pas valides dans un hote.
+    return false
+}
+
+// Un hote acceptable : non vide, sans CRLF, sans espace ni barre.
+fn hc_hote_valide(hote: Text) -> Bool {
+    if hote == "" {
+        return false
+    }
+    if hc_a_crlf(hote) {
+        return false
+    }
+    if has(find(hote, " ")) or has(find(hote, "/")) {
+        return false
+    }
+    return true
+}
+
+// ---------- Analyse d'URL ----------
+
+// Decoupe une URL absolue « schema://hote[:port]/chemin?query ».
+// Rejette (none) une URL malformee, un schema inconnu, une injection CRLF,
+// un hote invalide ou un port non numerique / hors plage.
+fn url_parse(url: Text) -> Option<UrlParties> {
+    if url == "" or hc_a_crlf(url) {
+        return none
+    }
+    let sep = find(url, "://")
+    if not has(sep) {
+        return none
+    }
+    let is = unwrap_or(sep, 0)
+    let schema = lower(sub(url, 0, is))
+    if schema != "http" and schema != "https" {
+        return none
+    }
+    var port_defaut = 80
+    if schema == "https" {
+        port_defaut = 443
+    }
+    let reste = sub(url, is + 3, len(url))
+    if reste == "" {
+        return none
+    }
+    // Autorite = jusqu'au premier / ? ou # ; le chemin commence au /.
+    var fin_autorite = len(reste)
+    let barre = find(reste, "/")
+    if has(barre) {
+        fin_autorite = unwrap_or(barre, 0)
+    }
+    let q = find(reste, "?")
+    if has(q) {
+        let iq = unwrap_or(q, 0)
+        if iq < fin_autorite {
+            fin_autorite = iq
+        }
+    }
+    let d = find(reste, "#")
+    if has(d) {
+        let idi = unwrap_or(d, 0)
+        if idi < fin_autorite {
+            fin_autorite = idi
+        }
+    }
+    var autorite = sub(reste, 0, fin_autorite)
+    // On ne gere pas les userinfo (user:pass@) : refus par prudence.
+    if has(find(autorite, "@")) {
+        return none
+    }
+    var hote = autorite
+    var port = port_defaut
+    let colon = find(autorite, ":")
+    if has(colon) {
+        let ic = unwrap_or(colon, 0)
+        hote = sub(autorite, 0, ic)
+        let port_txt = sub(autorite, ic + 1, len(autorite))
+        let p = parse_int(port_txt)
+        if not has(p) {
+            return none
+        }
+        port = unwrap_or(p, -1)
+        if port < 1 or port > 65535 {
+            return none
+        }
+    }
+    if not hc_hote_valide(hote) {
+        return none
+    }
+    // Chemin + query : tout ce qui suit l'autorite. Fragment (#...) retire.
+    var chemin = "/"
+    if fin_autorite < len(reste) {
+        let brut = sub(reste, fin_autorite, len(reste))
+        let frag = find(brut, "#")
+        if has(frag) {
+            chemin = sub(brut, 0, unwrap_or(frag, 0))
+        } else {
+            chemin = brut
+        }
+    }
+    if chemin == "" {
+        chemin = "/"
+    }
+    if not starts_with(chemin, "/") {
+        chemin = "/" + chemin
+    }
+    // Un chemin ne doit pas contenir de CRLF (deja filtre au niveau URL).
+    return some(UrlParties { schema: schema, hote: hote, port: port, chemin: chemin })
+}
+
+// Reconstruit l'URL absolue (utile pour la detection de boucle).
+fn url_rendu(u: UrlParties) -> Text {
+    var s = u.schema + "://" + u.hote
+    let defaut = 80
+    var d = defaut
+    if u.schema == "https" {
+        d = 443
+    }
+    if u.port != d {
+        s += ":" + text(u.port)
+    }
+    s += u.chemin
+    return s
+}
+
+// ---------- Acces aux en-tetes de la reponse ----------
+
+// Valeur d'un en-tete (insensible a la casse). none si absent.
+fn reponse_entete(rep: ReponseHttp, nom: Text) -> Option<Text> {
+    let cible = lower(nom)
+    for ligne in split(rep.entetes, "\r\n") {
+        let c = find(ligne, ":")
+        if has(c) {
+            let i = unwrap_or(c, 0)
+            if lower(trim(sub(ligne, 0, i))) == cible {
+                return some(trim(sub(ligne, i + 1, len(ligne))))
+            }
+        }
+    }
+    return none
+}
+
+// ---------- Construction de requete ----------
+
+// Fabrique une trame de requete HTTP/1.1 bien formee. `corps` vide = pas de
+// Content-Length (typique d'un GET). Renvoie none si un composant contient une
+// injection CRLF (hote / chemin / type de contenu).
+fn hc_construire_requete(methode: Text, u: UrlParties, type_contenu: Text, corps: Text, auth: Text) -> Option<Text> {
+    if hc_a_crlf(u.hote) or hc_a_crlf(u.chemin) or hc_a_crlf(type_contenu) or hc_a_crlf(methode) {
+        return none
+    }
+    var hote_ligne = u.hote
+    let d = 80
+    var dd = d
+    if u.schema == "https" {
+        dd = 443
+    }
+    if u.port != dd {
+        hote_ligne += ":" + text(u.port)
+    }
+    var r = methode + " " + u.chemin + " HTTP/1.1\r\n"
+    r += "Host: " + hote_ligne + "\r\n"
+    r += "User-Agent: nolc-http-client/1.0\r\n"
+    r += "Accept: */*\r\n"
+    if auth != "" { r += "Authorization: Bearer " + auth + "\r\n" }
+    r += "Connection: close\r\n"
+    if corps != "" {
+        if type_contenu != "" {
+            r += "Content-Type: " + type_contenu + "\r\n"
+        }
+        r += "Content-Length: " + text(len(corps)) + "\r\n"
+    }
+    r += "\r\n"
+    r += corps
+    return some(r)
+}
+
+// ---------- Lecture complete de la reponse ----------
+
+// Extrait le Content-Length d'un bloc d'en-tetes. -1 si absent, -2 si present
+// mais invalide (declenche un rejet).
+fn hc_content_length(bloc_entetes: Text) -> Int {
+    for ligne in split(bloc_entetes, "\r\n") {
+        let c = find(ligne, ":")
+        if has(c) {
+            let i = unwrap_or(c, 0)
+            if lower(trim(sub(ligne, 0, i))) == "content-length" {
+                let n = parse_int(trim(sub(ligne, i + 1, len(ligne))))
+                if not has(n) {
+                    return -2
+                }
+                let v = unwrap_or(n, -1)
+                if v < 0 {
+                    return -2
+                }
+                return v
+            }
+        }
+    }
+    return -1
+}
+
+// Accumule les tcp_read jusqu'a obtenir la reponse entiere :
+// - selon Content-Length si present (gere les lectures fragmentees) ;
+// - sinon jusqu'a fermeture de la connexion.
+// Renvoie le message brut, ou none si rien recu / depassement de `taille_max`.
+fn hc_lire_reponse(fd: Int, taille_max: Int) -> Option<Text> {
+    var buf = ""
+    var entetes_finis = false
+    var debut_corps = 0
+    var cl = -1
+    while true {
+        let morceau = tcp_read(fd)
+        if not has(morceau) {
+            // Connexion fermee par le pair : fin de la reponse.
+            break
+        }
+        buf += unwrap_or(morceau, "")
+        if len(buf) > taille_max {
+            return none
+        }
+        if not entetes_finis {
+            let sep = find(buf, "\r\n\r\n")
+            if has(sep) {
+                entetes_finis = true
+                let fe = unwrap_or(sep, 0)
+                debut_corps = fe + 4
+                cl = hc_content_length(sub(buf, 0, fe))
+                if cl == -2 {
+                    return none
+                }
+            }
+        }
+        if entetes_finis and cl >= 0 {
+            if len(buf) - debut_corps >= cl {
+                break
+            }
+        }
+    }
+    if buf == "" {
+        return none
+    }
+    return some(buf)
+}
+
+// Analyse un message HTTP brut en ReponseHttp. none si ligne de statut absente
+// ou code non numerique.
+fn hc_analyser_reponse(brut: Text) -> Option<ReponseHttp> {
+    let sep = find(brut, "\r\n\r\n")
+    if not has(sep) {
+        return none
+    }
+    let fe = unwrap_or(sep, 0)
+    let tete = sub(brut, 0, fe)
+    let corps_brut = sub(brut, fe + 4, len(brut))
+
+    // Ligne de statut = premiere ligne.
+    var ligne_statut = tete
+    var bloc_entetes = ""
+    let fl = find(tete, "\r\n")
+    if has(fl) {
+        let i = unwrap_or(fl, 0)
+        ligne_statut = sub(tete, 0, i)
+        bloc_entetes = sub(tete, i + 2, len(tete))
+    }
+    if not starts_with(ligne_statut, "HTTP/") {
+        return none
+    }
+    let e1 = find(ligne_statut, " ")
+    if not has(e1) {
+        return none
+    }
+    let apres = sub(ligne_statut, unwrap_or(e1, 0) + 1, len(ligne_statut))
+    var code_txt = apres
+    let e2 = find(apres, " ")
+    if has(e2) {
+        code_txt = sub(apres, 0, unwrap_or(e2, 0))
+    }
+    let code = parse_int(trim(code_txt))
+    if not has(code) {
+        return none
+    }
+    let statut = unwrap_or(code, 0)
+
+    // Tronque le corps a Content-Length si present et coherent.
+    var corps = corps_brut
+    let cl = hc_content_length(bloc_entetes)
+    if cl >= 0 and cl <= len(corps_brut) {
+        corps = sub(corps_brut, 0, cl)
+    }
+    return some(ReponseHttp { statut: statut, entetes: bloc_entetes, corps: corps })
+}
+
+// ---------- Lecture complete d'une reponse sur session TLS ----------
+
+// Comme hc_lire_reponse, mais lit via la session TLS (SSL_read). tls_client_lire
+// rend "" a la fermeture du flux (ou erreur), ce qui termine la boucle.
+fn hc_lire_reponse_tls(ssl: Ptr<TlsSession>, taille_max: Int) -> Option<Text> {
+    var buf = ""
+    var entetes_finis = false
+    var debut_corps = 0
+    var cl = -1
+    while true {
+        let morceau = tls_client_lire(ssl)
+        if morceau == "" {
+            // Fin de flux TLS : fin de la reponse.
+            break
+        }
+        buf += morceau
+        if len(buf) > taille_max {
+            return none
+        }
+        if not entetes_finis {
+            let sep = find(buf, "\r\n\r\n")
+            if has(sep) {
+                entetes_finis = true
+                let fe = unwrap_or(sep, 0)
+                debut_corps = fe + 4
+                cl = hc_content_length(sub(buf, 0, fe))
+                if cl == -2 {
+                    return none
+                }
+            }
+        }
+        if entetes_finis and cl >= 0 {
+            if len(buf) - debut_corps >= cl {
+                break
+            }
+        }
+    }
+    if buf == "" {
+        return none
+    }
+    return some(buf)
+}
+
+// ---------- Requete unitaire https:// (TLS client valide) ----------
+
+// Effectue UNE requete https:// avec validation stricte du certificat, du nom
+// d'hote et SNI (voir lib/tls.nol). none en cas d'echec (connexion TCP, contexte
+// TLS, handshake/validation refuses, construction ou lecture).
+fn hc_requete_une_https(methode: Text, u: UrlParties, type_contenu: Text, corps: Text, timeout_ms: Int, taille_max: Int, auth: Text) -> Option<ReponseHttp> {
+    if not hc_hote_valide(u.hote) {
+        return none
+    }
+    let req = hc_construire_requete(methode, u, type_contenu, corps, auth)
+    if not has(req) {
+        return none
+    }
+    let co = tcp_connect(u.hote, u.port)
+    if not has(co) {
+        return none
+    }
+    let fd = unwrap_or(co, -1)
+    tcp_set_timeout(fd, timeout_ms)
+    let octx = tls_client_contexte()
+    if not has(octx) {
+        tcp_close(fd)
+        return none
+    }
+    let ctx = unwrap_or(octx, ptr_null())
+    let ossl = tls_connecter(ctx, fd, u.hote)
+    if not has(ossl) {
+        // Certificat / nom d'hote / chaine invalides : REFUS, pas de repli clair.
+        tls_liberer_contexte(ctx)
+        tcp_close(fd)
+        return none
+    }
+    let ssl = unwrap_or(ossl, ptr_null())
+    if tls_ecrire(ssl, unwrap_or(req, "")) <= 0 {
+        tls_fermer(ssl)
+        tls_liberer_contexte(ctx)
+        tcp_close(fd)
+        return none
+    }
+    let brut = hc_lire_reponse_tls(ssl, taille_max)
+    tls_fermer(ssl)
+    tls_liberer_contexte(ctx)
+    tcp_close(fd)
+    if not has(brut) {
+        return none
+    }
+    return hc_analyser_reponse(unwrap_or(brut, ""))
+}
+
+// ---------- Requete unitaire (sans redirection) ----------
+
+// Effectue UNE requete (pas de suivi de redirection). Aiguille http:// (clair)
+// et https:// (TLS valide). none en cas d'echec (schema non gere, connexion,
+// construction, lecture).
+fn hc_requete_une(methode: Text, u: UrlParties, type_contenu: Text, corps: Text, timeout_ms: Int, taille_max: Int, auth: Text) -> Option<ReponseHttp> {
+    if u.schema == "https" {
+        return hc_requete_une_https(methode, u, type_contenu, corps, timeout_ms, taille_max, auth)
+    }
+    if u.schema != "http" {
+        // Schema non gere : refus honnete.
+        return none
+    }
+    if not hc_hote_valide(u.hote) {
+        return none
+    }
+    let req = hc_construire_requete(methode, u, type_contenu, corps, auth)
+    if not has(req) {
+        return none
+    }
+    let co = tcp_connect(u.hote, u.port)
+    if not has(co) {
+        return none
+    }
+    let fd = unwrap_or(co, -1)
+    tcp_set_timeout(fd, timeout_ms)
+    let envoye = tcp_write(fd, unwrap_or(req, ""))
+    if not envoye {
+        tcp_close(fd)
+        return none
+    }
+    let brut = hc_lire_reponse(fd, taille_max)
+    tcp_close(fd)
+    if not has(brut) {
+        return none
+    }
+    return hc_analyser_reponse(unwrap_or(brut, ""))
+}
+
+// ---------- Suivi de redirection ----------
+
+fn hc_est_redirection(code: Int) -> Bool {
+    return code == 301 or code == 302 or code == 303 or code == 307 or code == 308
+}
+
+// Resout une cible Location (absolue ou relative) par rapport a l'URL courante.
+// none si la cible est vide, malformee ou d'un schema non http.
+fn hc_resoudre_location(courant: UrlParties, location: Text) -> Option<UrlParties> {
+    let loc = trim(location)
+    if loc == "" or hc_a_crlf(loc) {
+        return none
+    }
+    if has(find(loc, "://")) {
+        // URL absolue.
+        return url_parse(loc)
+    }
+    // Relative : on garde schema/hote/port et on remplace le chemin.
+    var chemin = loc
+    if not starts_with(chemin, "/") {
+        // Relative au repertoire courant : on la rattache simplement a la racine
+        // du chemin courant pour rester previsible et sur.
+        let dernier = courant.chemin
+        var base = "/"
+        let bs = find(dernier, "?")
+        var sans_query = dernier
+        if has(bs) {
+            sans_query = sub(dernier, 0, unwrap_or(bs, 0))
+        }
+        var pos = -1
+        var i = 0
+        while i < len(sans_query) {
+            if char_at(sans_query, i) == "/" {
+                pos = i
+            }
+            i = i + 1
+        }
+        if pos >= 0 {
+            base = sub(sans_query, 0, pos + 1)
+        }
+        chemin = base + loc
+    }
+    if hc_a_crlf(chemin) {
+        return none
+    }
+    return some(UrlParties { schema: courant.schema, hote: courant.hote, port: courant.port, chemin: chemin })
+}
+
+// Requete avec suivi des redirections 301/302/303/307/308 (limite + detection
+// de boucle). Pour 301/302/303 la methode passe a GET et le corps est
+// abandonne ; 307/308 preservent methode et corps.
+fn hc_requete_suivie(methode0: Text, u0: UrlParties, type_contenu0: Text, corps0: Text, max_redir: Int, timeout_ms: Int, taille_max: Int, auth: Text) -> Option<ReponseHttp> {
+    var methode = methode0
+    var type_contenu = type_contenu0
+    var corps = corps0
+    var courant = u0
+    var visites: List<Text> = []
+    push(visites, url_rendu(courant))
+    var sauts = 0
+    while true {
+        let rep = hc_requete_une(methode, courant, type_contenu, corps, timeout_ms, taille_max, auth)
+        if not has(rep) {
+            return none
+        }
+        let r = unwrap_or(rep, ReponseHttp { statut: 0, entetes: "", corps: "" })
+        if not hc_est_redirection(r.statut) {
+            return some(r)
+        }
+        if sauts >= max_redir {
+            // Trop de redirections : on rend la derniere reponse telle quelle.
+            return some(r)
+        }
+        let loc = reponse_entete(r, "location")
+        if not has(loc) {
+            // Redirection sans Location : on rend la reponse.
+            return some(r)
+        }
+        let suivant = hc_resoudre_location(courant, unwrap_or(loc, ""))
+        if not has(suivant) {
+            return some(r)
+        }
+        let cible = unwrap_or(suivant, courant)
+        let cible_url = url_rendu(cible)
+        // Detection de boucle.
+        for v in visites {
+            if v == cible_url {
+                return some(r)
+            }
+        }
+        push(visites, cible_url)
+        // Ajustement de methode selon le code.
+        if r.statut == 301 or r.statut == 302 or r.statut == 303 {
+            if methode == "POST" or methode == "PUT" {
+                methode = "GET"
+                corps = ""
+                type_contenu = ""
+            }
+        }
+        courant = cible
+        sauts = sauts + 1
+    }
+    // Inatteignable, mais requis pour le typage.
+    return none
+}
+
+// ---------- API publique ----------
+
+// GET avec suivi de redirection (5 sauts max) et bornes par defaut.
+fn http_get(url: Text) -> Option<ReponseHttp> {
+    let u = url_parse(url)
+    if not has(u) {
+        return none
+    }
+    return hc_requete_suivie("GET", unwrap_or(u, UrlParties { schema: "http", hote: "", port: 80, chemin: "/" }), "", "", hc_redirections_max(), hc_timeout_defaut_ms(), hc_taille_max_defaut(), "")
+}
+
+// POST avec corps et type de contenu, suivi de redirection.
+fn http_post(url: Text, type_contenu: Text, corps: Text) -> Option<ReponseHttp> {
+    let u = url_parse(url)
+    if not has(u) {
+        return none
+    }
+    return hc_requete_suivie("POST", unwrap_or(u, UrlParties { schema: "http", hote: "", port: 80, chemin: "/" }), type_contenu, corps, hc_redirections_max(), hc_timeout_defaut_ms(), hc_taille_max_defaut(), "")
+}
+
+fn http_post_token(url: Text, type_contenu: Text, corps: Text, token: Text) -> Option<ReponseHttp> {
+    let u = url_parse(url)
+    if not has(u) { return none }
+    return hc_requete_suivie("POST", unwrap_or(u, UrlParties { schema: "http", hote: "", port: 80, chemin: "/" }), type_contenu, corps, hc_redirections_max(), hc_timeout_defaut_ms(), hc_taille_max_defaut(), token)
+}
+
+// GET sans suivre les redirections (rend la 3xx telle quelle).
+fn http_get_direct(url: Text) -> Option<ReponseHttp> {
+    let u = url_parse(url)
+    if not has(u) {
+        return none
+    }
+    return hc_requete_une("GET", unwrap_or(u, UrlParties { schema: "http", hote: "", port: 80, chemin: "/" }), "", "", hc_timeout_defaut_ms(), hc_taille_max_defaut(), "")
+}

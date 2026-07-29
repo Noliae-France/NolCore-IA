@@ -1,0 +1,1782 @@
+// Cadre web MVC minimal pour Nolc : analyse de requête, réponses, fichiers
+// statiques. Les vues sont des `.nhtml` transpilés (voir `nolc nhtml`).
+//
+// Le routage se fait dans un « dispatcher » que l'application écrit (match
+// sur méthode + chemin) : c'est le contrôleur central. Le cadre fournit les
+// briques ; l'app orchestre la boucle d'acceptation.
+
+import "crypto.nol"
+import "json.nol"
+
+// ---------- Requête ----------
+
+// Ligne de requête : « GET /chemin?query HTTP/1.1 ». Méthode = 1er mot.
+fn req_methode(requete: Text) -> Text {
+    let e = find(requete, " ")
+    if not has(e) {
+        return "GET"
+    }
+    return sub(requete, 0, unwrap_or(e, 0))
+}
+
+// Cible brute (chemin + éventuel ?query).
+fn req_cible(requete: Text) -> Text {
+    let d = find(requete, " ")
+    if not has(d) {
+        return "/"
+    }
+    let reste = sub(requete, unwrap_or(d, 0) + 1, len(requete))
+    let f = find(reste, " ")
+    if not has(f) {
+        return "/"
+    }
+    return sub(reste, 0, unwrap_or(f, 0))
+}
+
+// Chemin sans la query.
+fn req_chemin(requete: Text) -> Text {
+    let cible = req_cible(requete)
+    let q = find(cible, "?")
+    if not has(q) {
+        return cible
+    }
+    return sub(cible, 0, unwrap_or(q, 0))
+}
+
+// Paramètre de query (?cle=valeur&...), décodé. none si absent.
+fn req_query(requete: Text, cle: Text) -> Option<Text> {
+    let cible = req_cible(requete)
+    let q = find(cible, "?")
+    if not has(q) {
+        return none
+    }
+    let qs = sub(cible, unwrap_or(q, 0) + 1, len(cible))
+    for paire in split(qs, "&") {
+        let eq = find(paire, "=")
+        if has(eq) {
+            let i = unwrap_or(eq, 0)
+            if sub(paire, 0, i) == cle {
+                return some(url_decode(sub(paire, i + 1, len(paire))))
+            }
+        }
+    }
+    return none
+}
+
+// Corps de la requête (après l'en-tête).
+fn req_corps(requete: Text) -> Text {
+    let sep = find(requete, "\r\n\r\n")
+    if not has(sep) {
+        return ""
+    }
+    let i = unwrap_or(sep, 0) + 4
+    return sub(requete, i, len(requete))
+}
+
+// Champ d'un corps de formulaire (application/x-www-form-urlencoded), décodé.
+fn req_form(requete: Text, cle: Text) -> Option<Text> {
+    for paire in split(req_corps(requete), "&") {
+        let eq = find(paire, "=")
+        if has(eq) {
+            let i = unwrap_or(eq, 0)
+            if sub(paire, 0, i) == cle {
+                return some(url_decode(sub(paire, i + 1, len(paire))))
+            }
+        }
+    }
+    return none
+}
+
+// ---------- Réponses ----------
+
+fn rep_statut(code: Int, statut: Text, type_contenu: Text, corps: Text) -> Text {
+    return "HTTP/1.1 " + text(code) + " " + statut
+        + "\r\nServer: nolc-web"
+        + "\r\nContent-Type: " + type_contenu
+        + "\r\nContent-Length: " + text(len(corps))
+        + "\r\nConnection: close"
+        + "\r\n\r\n" + corps
+}
+
+fn rep_html(corps: Text) -> Text {
+    return rep_statut(200, "OK", "text/html; charset=utf-8", corps)
+}
+
+fn rep_json(corps: Text) -> Text {
+    return rep_statut(200, "OK", "application/json", corps)
+}
+
+fn rep_texte(corps: Text) -> Text {
+    return rep_statut(200, "OK", "text/plain; charset=utf-8", corps)
+}
+
+fn rep_redirige(url: Text) -> Text {
+    return "HTTP/1.1 302 Found\r\nLocation: " + url + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+}
+
+fn rep_404() -> Text {
+    return rep_statut(404, "Not Found", "text/html; charset=utf-8", "<h1>404</h1><p>Page introuvable.</p>")
+}
+
+// ---------- Configuration (nolweb.conf) ----------
+// Fichier de configuration façon .htaccess / web.config. Une directive par
+// ligne : « cle valeur ». Commentaires avec #. Exemple :
+//
+// port 8080
+// racine_statique ./public
+// prefixe_statique /static/
+// timeout_ms 5000
+// page_404 ./public/404.html
+// entete X-Frame-Options DENY
+// entete X-Content-Type-Options nosniff
+// redirige /ancien /nouveau
+//
+// `entete` et `redirige` peuvent apparaître plusieurs fois.
+
+// Directives simples (dernière valeur gagnante), hors entete/redirige.
+fn conf_lire(chemin: Text) -> Map<Text> {
+    var m: Map<Text> = map_new()
+    let c = file_read(chemin)
+    if not has(c) {
+        return m
+    }
+    for ligne in split(unwrap_or(c, ""), "\n") {
+        let l = trim(ligne)
+        if l == "" or starts_with(l, "#") {
+            continue
+        }
+        let sp = find(l, " ")
+        if not has(sp) {
+            continue
+        }
+        let i = unwrap_or(sp, 0)
+        let cle = sub(l, 0, i)
+        if cle == "entete" or cle == "redirige" {
+            continue
+        }
+        map_set(m, cle, trim(sub(l, i + 1, len(l))))
+    }
+    return m
+}
+
+fn conf_val(config: Map<Text>, cle: Text, defaut: Text) -> Text {
+    return unwrap_or(map_get(config, cle), defaut)
+}
+
+fn conf_int(config: Map<Text>, cle: Text, defaut: Int) -> Int {
+    return unwrap_or(parse_int(conf_val(config, cle, "")), defaut)
+}
+
+// En-têtes à injecter dans chaque réponse (lignes « Nom: Valeur »).
+fn conf_entetes(chemin: Text) -> List<Text> {
+    var res: List<Text> = []
+    let c = file_read(chemin)
+    if not has(c) {
+        return res
+    }
+    for ligne in split(unwrap_or(c, ""), "\n") {
+        let l = trim(ligne)
+        if starts_with(l, "entete ") {
+            let reste = trim(sub(l, 7, len(l)))
+            let sp = find(reste, " ")
+            if has(sp) {
+                let i = unwrap_or(sp, 0)
+                push(res, sub(reste, 0, i) + ": " + trim(sub(reste, i + 1, len(reste))))
+            }
+        }
+    }
+    return res
+}
+
+// Redirections : chemin source -> destination.
+fn conf_redirections(chemin: Text) -> Map<Text> {
+    var m: Map<Text> = map_new()
+    let c = file_read(chemin)
+    if not has(c) {
+        return m
+    }
+    for ligne in split(unwrap_or(c, ""), "\n") {
+        let l = trim(ligne)
+        if starts_with(l, "redirige ") {
+            let reste = trim(sub(l, 9, len(l)))
+            let sp = find(reste, " ")
+            if has(sp) {
+                let i = unwrap_or(sp, 0)
+                map_set(m, sub(reste, 0, i), trim(sub(reste, i + 1, len(reste))))
+            }
+        }
+    }
+    return m
+}
+
+// Injecte des en-têtes dans une réponse HTTP déjà construite.
+fn web_injecter_entetes(reponse: Text, entetes: List<Text>) -> Text {
+    let fin_ligne = find(reponse, "\r\n")
+    if not has(fin_ligne) or len(entetes) == 0 {
+        return reponse
+    }
+    let i = unwrap_or(fin_ligne, 0) + 2
+    var ajout = ""
+    for e in entetes {
+        ajout += e + "\r\n"
+    }
+    return sub(reponse, 0, i) + ajout + sub(reponse, i, len(reponse))
+}
+
+// ---------- Router à handlers enregistrés ----------
+// Un handler est une fonction `Fn(Text) -> Text` : reçoit la requête brute,
+// renvoie la réponse HTTP complète. Le router = trois listes parallèles
+// (méthode, chemin, handler) que l'application remplit avec `route`.
+
+fn route(methodes: List<Text>, chemins: List<Text>, handlers: List<Fn(Text) -> Text>, methode: Text, chemin: Text, handler: Fn(Text) -> Text) {
+    push(methodes, methode)
+    push(chemins, chemin)
+    push(handlers, handler)
+}
+
+// Cherche la route correspondante et l'exécute ; sinon 404.
+fn routeur_dispatch(methodes: List<Text>, chemins: List<Text>, handlers: List<Fn(Text) -> Text>, requete: Text) -> Text {
+    let m = req_methode(requete)
+    let ch = req_chemin(requete)
+    var i = 0
+    while i < len(chemins) {
+        if get(methodes, i) == m and get(chemins, i) == ch {
+            let h = get(handlers, i)
+            return h(requete)
+        }
+        i = i + 1
+    }
+    return rep_404()
+}
+
+// ---------- Types structurés : Requete / Reponse ----------
+// Les en-têtes restent stockés en bloc Text brut (« Nom: Valeur » séparés par
+// \r\n) pour préserver l'ordre, les doublons et la compatibilité HTTP. Les
+// accesseurs typés (`requete_entete`, `requete_cookie`, etc.) masquent ce détail.
+
+record Requete {
+    methode: Text,
+    chemin: Text,
+    version: Text,
+    query: Text,
+    entetes: Text,
+    corps: Text
+}
+
+record Reponse {
+    statut: Int,
+    statut_texte: Text,
+    type_contenu: Text,
+    entetes: Text,
+    corps: Text
+}
+
+record WebLimites {
+    max_entetes: Int,
+    max_corps: Int,
+    lecture_timeout_ms: Int,
+    ecriture_timeout_ms: Int,
+    keep_alive_ms: Int,
+    max_requetes_keepalive: Int
+}
+
+record ErreurHttp {
+    statut: Int,
+    titre: Text,
+    detail_public: Text,
+    requete_id: Text
+}
+
+record LimiteurDebit {
+    cle: Text,
+    fenetre_debut_ms: Int,
+    compteur: Int,
+    max_requetes: Int,
+    fenetre_ms: Int
+}
+
+record MultipartChamp {
+    nom: Text,
+    fichier: Text,
+    type_contenu: Text,
+    contenu: Text
+}
+
+// Session stateless signee : sujet|expiration|nonce|signature.
+record SessionSigne {
+    sujet: Text,
+    expiration: Int,
+    nonce: Text
+}
+
+// Session stateless signee avec rotation : kid|sujet|expiration|nonce|signature.
+record SessionSigneCle {
+    kid: Text,
+    sujet: Text,
+    expiration: Int,
+    nonce: Text
+}
+
+enum WebResultat {
+    WebOk(Reponse),
+    WebEchec(ErreurHttp)
+}
+
+// Résultat de l'analyse incrémentale d'un tampon TCP.
+enum Analyse {
+    Complet(Requete),
+    Incomplet,
+    Erreur(Int)
+}
+
+record ChunkDecode {
+    corps: Text,
+    consomme: Int
+}
+
+enum ChunkAnalyse {
+    ChunkComplet(ChunkDecode),
+    ChunkIncomplet,
+    ChunkErreur(Int)
+}
+
+// Cherche `motif` dans `s` à partir de l'index `depuis`. none si absent.
+fn web_find_depuis(s: Text, motif: Text, depuis: Int) -> Option<Int> {
+    if depuis >= len(s) {
+        return none
+    }
+    let reste = sub(s, depuis, len(s))
+    let p = find(reste, motif)
+    if not has(p) {
+        return none
+    }
+    return some(unwrap_or(p, 0) + depuis)
+}
+
+// Valeur d'un en-tête de la requête (insensible à la casse). none si absent.
+fn requete_entete(req: Requete, nom: Text) -> Option<Text> {
+    let cible = lower(nom)
+    for ligne in split(req.entetes, "\r\n") {
+        let c = find(ligne, ":")
+        if has(c) {
+            let i = unwrap_or(c, 0)
+            if lower(trim(sub(ligne, 0, i))) == cible {
+                return some(trim(sub(ligne, i + 1, len(ligne))))
+            }
+        }
+    }
+    return none
+}
+
+// Paramètre de query (?cle=valeur&...), décodé. none si absent.
+fn requete_query(req: Requete, cle: Text) -> Option<Text> {
+    for paire in split(req.query, "&") {
+        let eq = find(paire, "=")
+        if has(eq) {
+            let i = unwrap_or(eq, 0)
+            if sub(paire, 0, i) == cle {
+                return some(url_decode(sub(paire, i + 1, len(paire))))
+            }
+        }
+    }
+    return none
+}
+
+// Cookie de requête, lu dans l'en-tête Cookie. none si absent.
+fn requete_cookie(req: Requete, nom: Text) -> Option<Text> {
+    let h = requete_entete(req, "Cookie")
+    if not has(h) {
+        return none
+    }
+    for paire_brute in split(unwrap_or(h, ""), ";") {
+        let paire = trim(paire_brute)
+        let eq = find(paire, "=")
+        if has(eq) {
+            let i = unwrap_or(eq, 0)
+            if trim(sub(paire, 0, i)) == nom {
+                return some(url_decode(trim(sub(paire, i + 1, len(paire)))))
+            }
+        }
+    }
+    return none
+}
+
+// Champ d'un corps de formulaire application/x-www-form-urlencoded, décodé.
+fn requete_form(req: Requete, cle: Text) -> Option<Text> {
+    for paire in split(req.corps, "&") {
+        let eq = find(paire, "=")
+        if has(eq) {
+            let i = unwrap_or(eq, 0)
+            if sub(paire, 0, i) == cle {
+                return some(url_decode(sub(paire, i + 1, len(paire))))
+            }
+        }
+    }
+    return none
+}
+
+fn web_segment_est_param(segment: Text) -> Bool {
+    return len(segment) > 1 and starts_with(segment, ":")
+}
+
+// Compare un patron de route (`/users/:id`) avec un chemin et rend les params.
+fn route_params(patron: Text, chemin: Text) -> Option<Map<Text>> {
+    var params: Map<Text> = map_new()
+    let ps = split(patron, "/")
+    let cs = split(chemin, "/")
+    if len(ps) != len(cs) {
+        return none
+    }
+    var i = 0
+    while i < len(ps) {
+        let p = get(ps, i)
+        let c = get(cs, i)
+        if web_segment_est_param(p) {
+            if c == "" {
+                return none
+            }
+            let decode = url_decode(c)
+            if has(find(decode, "\r")) or has(find(decode, "\n")) {
+                return none
+            }
+            map_set(params, sub(p, 1, len(p) - 1), decode)
+        } else if p != c {
+            return none
+        }
+        i = i + 1
+    }
+    return some(params)
+}
+
+fn route_param(params: Map<Text>, nom: Text) -> Option<Text> {
+    return map_get(params, nom)
+}
+
+fn route_type(methodes: List<Text>, patrons: List<Text>, handlers: List<Fn(Requete, Map<Text>) -> WebResultat>, methode: Text, patron: Text, handler: Fn(Requete, Map<Text>) -> WebResultat) {
+    push(methodes, methode)
+    push(patrons, patron)
+    push(handlers, handler)
+}
+
+fn routeur_dispatch_type(methodes: List<Text>, patrons: List<Text>, handlers: List<Fn(Requete, Map<Text>) -> WebResultat>, req: Requete) -> WebResultat {
+    var allow = ""
+    var i = 0
+    while i < len(patrons) {
+        let params = route_params(get(patrons, i), req.chemin)
+        if has(params) {
+            let methode = get(methodes, i)
+            if methode == req.methode or (req.methode == "HEAD" and methode == "GET") {
+                let h = get(handlers, i)
+                match params {
+                    some(p) => return h(req, p)
+                    none => return WebResultat.WebEchec(erreur_http_depuis_code(404, requete_id(req)))
+                }
+            }
+            if allow != "" {
+                allow += ", "
+            }
+            allow += methode
+        }
+        i = i + 1
+    }
+    if allow != "" {
+        if req.methode == "OPTIONS" {
+            var options = reponse_sans_contenu()
+            options = reponse_avec_entete(options, "Allow", allow + ", OPTIONS")
+            return WebResultat.WebOk(options)
+        }
+        return WebResultat.WebOk(reponse_405(allow))
+    }
+    return WebResultat.WebEchec(erreur_http_depuis_code(404, requete_id(req)))
+}
+
+fn web_hex_valeur(c: Text) -> Option<Int> {
+    let p = find("0123456789abcdef", lower(c))
+    return p
+}
+
+fn web_hex_parse(t: Text) -> Option<Int> {
+    let s = t
+    if s == "" {
+        return none
+    }
+    var n = 0
+    var i = 0
+    while i < len(s) {
+        let v = web_hex_valeur(sub(s, i, 1))
+        if not has(v) {
+            return none
+        }
+        if n > 576460752303423487 {
+            return none
+        }
+        n = n * 16 + unwrap_or(v, 0)
+        i = i + 1
+    }
+    return some(n)
+}
+
+fn web_hex_chiffre(n: Int) -> Text {
+    return sub("0123456789abcdef", n, 1)
+}
+
+fn web_hex_int(n0: Int) -> Text {
+    if n0 <= 0 {
+        return "0"
+    }
+    var n = n0
+    var out = ""
+    while n > 0 {
+        out = web_hex_chiffre(n % 16) + out
+        n = n / 16
+    }
+    return out
+}
+
+fn web_nom_entete_valide(nom: Text) -> Bool {
+    if nom == "" {
+        return false
+    }
+    let autorises = "!#$%&'*+-.^_`|~"
+    var i = 0
+    while i < len(nom) {
+        let c = sub(nom, i, 1)
+        let lettre = contains("abcdefghijklmnopqrstuvwxyz", lower(c))
+        let chiffre = has(parse_int(c))
+        if not lettre and not chiffre and not contains(autorises, c) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn web_methode_valide(methode: Text) -> Bool {
+    return web_nom_entete_valide(methode) and methode == upper(methode)
+}
+
+fn web_decimal_strict(s: Text) -> Bool {
+    if s == "" {
+        return false
+    }
+    var i = 0
+    while i < len(s) {
+        if not contains("0123456789", sub(s, i, 1)) {
+            return false
+        }
+        i += 1
+    }
+    return true
+}
+
+fn web_trailers_valides(bloc: Text) -> Bool {
+    if bloc == "" {
+        return true
+    }
+    for ligne in split(bloc, "\r\n") {
+        let c = find(ligne, ":")
+        if not has(c) {
+            return false
+        }
+        let i = unwrap_or(c, 0)
+        let nom = trim(sub(ligne, 0, i))
+        if not web_nom_entete_valide(nom) {
+            return false
+        }
+        let interdit = lower(nom)
+        if interdit == "content-length" or interdit == "transfer-encoding" or interdit == "host" {
+            return false
+        }
+    }
+    return true
+}
+
+// Décode un corps chunked et rend aussi le nombre exact d'octets consommés.
+fn http_chunked_analyser(buf: Text, max_corps: Int) -> ChunkAnalyse {
+    if max_corps < 0 {
+        return ChunkAnalyse.ChunkErreur(413)
+    }
+    var pos = 0
+    var corps = ""
+    var chunks = 0
+    while true {
+        chunks += 1
+        if chunks > 16384 {
+            return ChunkAnalyse.ChunkErreur(413)
+        }
+        let fin_ligne = web_find_depuis(buf, "\r\n", pos)
+        if not has(fin_ligne) {
+            return ChunkAnalyse.ChunkIncomplet
+        }
+        let i = unwrap_or(fin_ligne, 0)
+        var taille_txt = sub(buf, pos, i - pos)
+        if taille_txt != trim(taille_txt) {
+            return ChunkAnalyse.ChunkErreur(400)
+        }
+        let ext = find(taille_txt, ";")
+        if has(ext) {
+            let iext = unwrap_or(ext, 0)
+            if iext == 0 or iext == len(taille_txt) - 1 {
+                return ChunkAnalyse.ChunkErreur(400)
+            }
+            taille_txt = sub(taille_txt, 0, iext)
+        }
+        let taille = web_hex_parse(taille_txt)
+        if not has(taille) {
+            return ChunkAnalyse.ChunkErreur(400)
+        }
+        let n = unwrap_or(taille, 0)
+        if n < 0 or n > max_corps or len(corps) > max_corps - n {
+            return ChunkAnalyse.ChunkErreur(413)
+        }
+        pos = i + 2
+        if n == 0 {
+            let fin_trailers = web_find_depuis(buf, "\r\n\r\n", pos)
+            if starts_with(sub(buf, pos, len(buf) - pos), "\r\n") {
+                return ChunkAnalyse.ChunkComplet(ChunkDecode { corps: corps, consomme: pos + 2 })
+            }
+            if not has(fin_trailers) {
+                return ChunkAnalyse.ChunkIncomplet
+            }
+            let fin = unwrap_or(fin_trailers, 0)
+            if not web_trailers_valides(sub(buf, pos, fin - pos)) {
+                return ChunkAnalyse.ChunkErreur(400)
+            }
+            return ChunkAnalyse.ChunkComplet(ChunkDecode { corps: corps, consomme: fin + 4 })
+        }
+        if n > len(buf) - pos or len(buf) - pos - n < 2 {
+            return ChunkAnalyse.ChunkIncomplet
+        }
+        if sub(buf, pos + n, 2) != "\r\n" {
+            return ChunkAnalyse.ChunkErreur(400)
+        }
+        corps += sub(buf, pos, n)
+        pos = pos + n + 2
+    }
+    return ChunkAnalyse.ChunkErreur(400)
+}
+
+// Compatibilité : none signifie incomplet ou invalide. Le parseur principal
+// utilise `http_chunked_analyser` pour conserver la cause exacte.
+fn http_chunked_decode(buf: Text, max_corps: Int) -> Option<Text> {
+    match http_chunked_analyser(buf, max_corps) {
+        ChunkComplet(r) => return some(r.corps)
+        ChunkIncomplet => return none
+        ChunkErreur(_code) => return none
+    }
+    return none
+}
+
+// Reliquat après la première requête complète d'un tampon keep-alive.
+// none signifie que la première requête est encore incomplète ou invalide.
+fn http_reliquat(buf: Text, max_entetes: Int, max_corps: Int) -> Option<Text> {
+    let sep = find(buf, "\r\n\r\n")
+    if not has(sep) {
+        return none
+    }
+    let fin_ent = unwrap_or(sep, 0)
+    if fin_ent > max_entetes {
+        return none
+    }
+    let bloc = sub(buf, 0, fin_ent)
+    var cl = 0
+    var cl_vu = false
+    var chunked = false
+    for ligne in split(bloc, "\r\n") {
+        let c = find(ligne, ":")
+        if has(c) {
+            let i = unwrap_or(c, 0)
+            let nom = lower(trim(sub(ligne, 0, i)))
+            let val = trim(sub(ligne, i + 1, len(ligne)))
+            if nom == "content-length" {
+                let n = parse_int(val)
+                if not has(n) {
+                    return none
+                }
+                cl = unwrap_or(n, 0)
+                cl_vu = true
+            }
+            if nom == "transfer-encoding" and contains(lower(val), "chunked") {
+                chunked = true
+            }
+        }
+    }
+    let debut_corps = fin_ent + 4
+    if chunked {
+        let morceaux = sub(buf, debut_corps, len(buf) - debut_corps)
+        match http_chunked_analyser(morceaux, max_corps) {
+            ChunkComplet(r) => return some(sub(buf, debut_corps + r.consomme, len(buf) - debut_corps - r.consomme))
+            ChunkIncomplet => return none
+            ChunkErreur(_code) => return none
+        }
+    }
+    if cl_vu {
+        if cl < 0 or cl > max_corps or len(buf) < debut_corps + cl {
+            return none
+        }
+        return some(sub(buf, debut_corps + cl, len(buf) - debut_corps - cl))
+    }
+    return some(sub(buf, debut_corps, len(buf) - debut_corps))
+}
+
+// ---------- Parseur HTTP/1.1 incrémental avec limites ----------
+// Analyse un tampon (potentiellement partiel, issu de plusieurs `tcp_read`).
+// Renvoie :
+// Complet(req)   : ligne de requête + en-têtes + corps entièrement reçus
+// Incomplet      : il manque des octets, rappeler après un nouveau read
+// Erreur(code)   : 400 (malformée / injection / Content-Length ambigu),
+// 413 (corps trop grand), 431 (en-têtes trop grands)
+//
+// `max_entetes` et `max_corps` bornent la mémoire (anti-DoS). Gère
+// Content-Length, Transfer-Encoding: chunked complet et les fragments TCP.
+// `http_reliquat` permet de reprendre le tampon après une requête keep-alive.
+// Ne gère PAS : HTTP/2, upload multipart streaming vers disque ni WebSocket.
+// SÉCURITÉ : rejette les CR/LF nus, Content-Length dupliqués, TE+CL,
+// Transfer-Encoding inconnu, Host ambigu et trailers de cadrage.
+fn http_analyser(buf: Text, max_entetes: Int, max_corps: Int) -> Analyse {
+    let sep = find(buf, "\r\n\r\n")
+    if not has(sep) {
+        // En-têtes pas encore terminés : attendre, sauf débordement.
+        if len(buf) > max_entetes {
+            return Analyse.Erreur(431)
+        }
+        return Analyse.Incomplet
+    }
+    let fin_ent = unwrap_or(sep, 0)
+    if fin_ent > max_entetes {
+        return Analyse.Erreur(431)
+    }
+    let bloc = sub(buf, 0, fin_ent)
+    let bloc_sans_crlf = replace(bloc, "\r\n", "")
+    if has(find(bloc_sans_crlf, "\r")) or has(find(bloc_sans_crlf, "\n")) {
+        return Analyse.Erreur(400)
+    }
+
+    // --- Ligne de requête ---
+    let fl = find(bloc, "\r\n")
+    var ligne_req = bloc
+    var bloc_ent = ""
+    if has(fl) {
+        let i = unwrap_or(fl, 0)
+        ligne_req = sub(bloc, 0, i)
+        bloc_ent = sub(bloc, i + 2, len(bloc))
+    }
+    let e1 = find(ligne_req, " ")
+    if not has(e1) {
+        return Analyse.Erreur(400)
+    }
+    let i1 = unwrap_or(e1, 0)
+    let methode = sub(ligne_req, 0, i1)
+    let reste1 = sub(ligne_req, i1 + 1, len(ligne_req))
+    let e2 = find(reste1, " ")
+    if not has(e2) {
+        return Analyse.Erreur(400)
+    }
+    let i2 = unwrap_or(e2, 0)
+    let cible = sub(reste1, 0, i2)
+    let version = sub(reste1, i2 + 1, len(reste1) - i2 - 1)
+    if not web_methode_valide(methode) or cible == "" {
+        return Analyse.Erreur(400)
+    }
+    if version != "HTTP/1.1" and version != "HTTP/1.0" {
+        return Analyse.Erreur(400)
+    }
+    if cible != "*" and (not starts_with(cible, "/") or has(find(cible, "#"))) {
+        return Analyse.Erreur(400)
+    }
+
+    // --- Chemin / query ---
+    var chemin = cible
+    var query = ""
+    let q = find(cible, "?")
+    if has(q) {
+        let iq = unwrap_or(q, 0)
+        chemin = sub(cible, 0, iq)
+        query = sub(cible, iq + 1, len(cible))
+    }
+
+    // --- En-têtes : validation + Content-Length ---
+    var cl = -1
+    var cl_vu = false
+    var chunked = false
+    var te_vu = false
+    var host_vu = false
+    for ligne in split(bloc_ent, "\r\n") {
+        if ligne == "" {
+            continue
+        }
+        // Un CR ou LF nu survit au découpage sur \r\n : c'est une injection.
+        if has(find(ligne, "\r")) or has(find(ligne, "\n")) {
+            return Analyse.Erreur(400)
+        }
+        let c = find(ligne, ":")
+        if not has(c) {
+            return Analyse.Erreur(400)
+        }
+        let ic = unwrap_or(c, 0)
+        let nom = trim(sub(ligne, 0, ic))
+        let val = trim(sub(ligne, ic + 1, len(ligne)))
+        if not web_nom_entete_valide(nom) {
+            return Analyse.Erreur(400)
+        }
+        if lower(nom) == "host" {
+            if host_vu or val == "" or has(find(val, ",")) or has(find(val, " ")) or has(find(val, "\t")) or has(find(val, "/")) or has(find(val, "\\")) {
+                return Analyse.Erreur(400)
+            }
+            host_vu = true
+        }
+        if lower(nom) == "content-length" {
+            if cl_vu {
+                return Analyse.Erreur(400)
+            }
+            if not web_decimal_strict(val) {
+                return Analyse.Erreur(400)
+            }
+            let n = parse_int(val)
+            if not has(n) {
+                return Analyse.Erreur(400)
+            }
+            let v = unwrap_or(n, -1)
+            if v < 0 {
+                return Analyse.Erreur(400)
+            }
+            cl = v
+            cl_vu = true
+        }
+        if lower(nom) == "transfer-encoding" {
+            if te_vu or lower(val) != "chunked" {
+                return Analyse.Erreur(400)
+            }
+            te_vu = true
+            chunked = true
+        }
+    }
+    if version == "HTTP/1.1" and not host_vu {
+        return Analyse.Erreur(400)
+    }
+    if chunked and cl_vu {
+        return Analyse.Erreur(400)
+    }
+
+    // --- Corps ---
+    let debut_corps = fin_ent + 4
+    let dispo = len(buf) - debut_corps
+    var corps = ""
+    if chunked {
+        match http_chunked_analyser(sub(buf, debut_corps, len(buf) - debut_corps), max_corps) {
+            ChunkComplet(r) => corps = r.corps
+            ChunkIncomplet => return Analyse.Incomplet
+            ChunkErreur(code) => return Analyse.Erreur(code)
+        }
+    } else if cl_vu {
+        if cl > max_corps {
+            return Analyse.Erreur(413)
+        }
+        if dispo < cl {
+            return Analyse.Incomplet
+        }
+        corps = sub(buf, debut_corps, cl)
+    }
+
+    return Analyse.Complet(Requete { methode: methode, chemin: chemin, version: version, query: query, entetes: bloc_ent, corps: corps })
+}
+
+// ---------- Construction de réponses structurées ----------
+
+fn reponse_new(statut: Int, statut_texte: Text, type_contenu: Text, corps: Text) -> Reponse {
+    return Reponse { statut: statut, statut_texte: statut_texte, type_contenu: type_contenu, entetes: "", corps: corps }
+}
+
+fn reponse_html(corps: Text) -> Reponse {
+    return reponse_new(200, "OK", "text/html; charset=utf-8", corps)
+}
+
+fn reponse_json(corps: Text) -> Reponse {
+    return reponse_new(200, "OK", "application/json", corps)
+}
+
+fn reponse_texte(corps: Text) -> Reponse {
+    return reponse_new(200, "OK", "text/plain; charset=utf-8", corps)
+}
+
+fn reponse_creee_json(corps: Text, emplacement: Text) -> Reponse {
+    var r = reponse_new(201, "Created", "application/json", corps)
+    if emplacement != "" {
+        r = reponse_avec_entete(r, "Location", emplacement)
+    }
+    return r
+}
+
+fn reponse_sans_contenu() -> Reponse {
+    return reponse_new(204, "No Content", "text/plain; charset=utf-8", "")
+}
+
+fn reponse_redirection(statut: Int, emplacement: Text) -> Reponse {
+    var code = statut
+    var texte_statut = "Found"
+    if statut != 301 and statut != 302 and statut != 303 and statut != 307 and statut != 308 {
+        code = 303
+        texte_statut = "See Other"
+    } else if statut == 301 {
+        texte_statut = "Moved Permanently"
+    } else if statut == 303 {
+        texte_statut = "See Other"
+    } else if statut == 307 {
+        texte_statut = "Temporary Redirect"
+    } else if statut == 308 {
+        texte_statut = "Permanent Redirect"
+    }
+    var r = reponse_new(code, texte_statut, "text/plain; charset=utf-8", "")
+    r = reponse_avec_entete(r, "Location", emplacement)
+    return r
+}
+
+fn requete_type_contenu(req: Requete, attendu: Text) -> Bool {
+    let type_recu = lower(unwrap_or(requete_entete(req, "Content-Type"), ""))
+    return type_recu == lower(attendu) or starts_with(type_recu, lower(attendu) + ";")
+}
+
+fn requete_json(req: Requete) -> Option<Text> {
+    if not requete_type_contenu(req, "application/json") {
+        return none
+    }
+    let corps = trim(req.corps)
+    if not json_valide(corps) {
+        return none
+    }
+    return some(corps)
+}
+
+// Ajoute un en-tête personnalisé. Refuse (ignore) toute valeur contenant un
+// CR/LF nu : garde-fou anti-injection lors de la construction de la réponse.
+fn reponse_avec_entete(r: Reponse, nom: Text, valeur: Text) -> Reponse {
+    if has(find(nom, "\r")) or has(find(nom, "\n")) or has(find(valeur, "\r")) or has(find(valeur, "\n")) {
+        return r
+    }
+    if not web_nom_entete_valide(nom) {
+        return r
+    }
+    let reserve = lower(nom)
+    if reserve == "content-length" or reserve == "transfer-encoding" or reserve == "connection" or reserve == "server" {
+        return r
+    }
+    var e = r.entetes
+    if e != "" {
+        e += "\r\n"
+    }
+    e += nom + ": " + valeur
+    return Reponse { statut: r.statut, statut_texte: r.statut_texte, type_contenu: r.type_contenu, entetes: e, corps: r.corps }
+}
+
+fn web_cookie_sur(nom: Text, valeur: Text) -> Bool {
+    if nom == "" {
+        return false
+    }
+    return not has(find(nom, "\r")) and not has(find(nom, "\n")) and not has(find(nom, ";")) and not has(find(nom, "=")) and not has(find(valeur, "\r")) and not has(find(valeur, "\n")) and not has(find(valeur, ";"))
+}
+
+// Ajoute un Set-Cookie borné. `same_site` attendu : Strict, Lax ou None.
+fn reponse_cookie(r: Reponse, nom: Text, valeur: Text, max_age: Int, http_only: Bool, secure: Bool, same_site: Text) -> Reponse {
+    if not web_cookie_sur(nom, valeur) {
+        return r
+    }
+    var v = nom + "=" + valeur + "; Path=/"
+    if max_age >= 0 {
+        v += "; Max-Age=" + text(max_age)
+    }
+    if http_only {
+        v += "; HttpOnly"
+    }
+    if secure {
+        v += "; Secure"
+    }
+    if same_site == "Strict" or same_site == "Lax" or same_site == "None" {
+        v += "; SameSite=" + same_site
+    }
+    return reponse_avec_entete(r, "Set-Cookie", v)
+}
+
+fn reponse_cors(r: Reponse, origine: Text, methodes: Text, entetes: Text) -> Reponse {
+    var out = reponse_avec_entete(r, "Access-Control-Allow-Origin", origine)
+    out = reponse_avec_entete(out, "Vary", "Origin")
+    if methodes != "" {
+        out = reponse_avec_entete(out, "Access-Control-Allow-Methods", methodes)
+    }
+    if entetes != "" {
+        out = reponse_avec_entete(out, "Access-Control-Allow-Headers", entetes)
+    }
+    return out
+}
+
+fn requete_origine_autorisee(req: Requete, origines: List<Text>) -> Option<Text> {
+    let origine = requete_entete(req, "Origin")
+    if not has(origine) {
+        return none
+    }
+    let cible = unwrap_or(origine, "")
+    for permise in origines {
+        if permise == cible {
+            return some(cible)
+        }
+    }
+    return none
+}
+
+fn requete_bearer(req: Requete) -> Option<Text> {
+    let autorisation = requete_entete(req, "Authorization")
+    if not has(autorisation) {
+        return none
+    }
+    let valeur = unwrap_or(autorisation, "")
+    if not starts_with(valeur, "Bearer ") or len(valeur) <= 7 {
+        return none
+    }
+    let jeton = trim(sub(valeur, 7, len(valeur) - 7))
+    if jeton == "" or has(find(jeton, " ")) or len(jeton) > 8192 {
+        return none
+    }
+    return some(jeton)
+}
+
+fn sse_evenement(event: Text, id: Text, data: Text, retry_ms: Int) -> Text {
+    var out = ""
+    if id != "" {
+        out += "id: " + replace(replace(id, "\r", ""), "\n", "") + "\n"
+    }
+    if event != "" {
+        out += "event: " + replace(replace(event, "\r", ""), "\n", "") + "\n"
+    }
+    if retry_ms >= 0 {
+        out += "retry: " + text(retry_ms) + "\n"
+    }
+    for ligne in split(replace(data, "\r", ""), "\n") {
+        out += "data: " + ligne + "\n"
+    }
+    return out + "\n"
+}
+
+fn reponse_sse(corps: Text) -> Reponse {
+    var r = reponse_new(200, "OK", "text/event-stream; charset=utf-8", corps)
+    r = reponse_avec_entete(r, "Cache-Control", "no-cache")
+    r = reponse_avec_entete(r, "X-Accel-Buffering", "no")
+    return r
+}
+
+fn reponse_rendu_chunked(statut: Int, statut_texte: Text, type_contenu: Text, entetes: Text, morceaux: List<Text>) -> Text {
+    var s = "HTTP/1.1 " + text(statut) + " " + statut_texte + "\r\n"
+    s += "Server: nolc-web\r\n"
+    s += "Content-Type: " + type_contenu + "\r\n"
+    s += "Transfer-Encoding: chunked\r\n"
+    if entetes != "" {
+        s += entetes + "\r\n"
+    }
+    s += "Connection: close\r\n\r\n"
+    for morceau in morceaux {
+        s += web_hex_int(len(morceau)) + "\r\n" + morceau + "\r\n"
+    }
+    s += "0\r\n\r\n"
+    return s
+}
+
+fn reponse_stream_texte(morceaux: List<Text>) -> Text {
+    return reponse_rendu_chunked(200, "OK", "text/plain; charset=utf-8", "", morceaux)
+}
+
+fn reponse_stream_sse(morceaux: List<Text>) -> Text {
+    return reponse_rendu_chunked(200, "OK", "text/event-stream; charset=utf-8", "Cache-Control: no-cache\r\nX-Accel-Buffering: no", morceaux)
+}
+
+fn web_limites_defaut() -> WebLimites {
+    return WebLimites { max_entetes: 8192, max_corps: 1048576, lecture_timeout_ms: 5000, ecriture_timeout_ms: 5000, keep_alive_ms: 5000, max_requetes_keepalive: 100 }
+}
+
+fn erreur_http(statut: Int, titre: Text, detail_public: Text, requete_id: Text) -> ErreurHttp {
+    return ErreurHttp { statut: statut, titre: titre, detail_public: detail_public, requete_id: requete_id }
+}
+
+fn erreur_http_depuis_code(code: Int, requete_id: Text) -> ErreurHttp {
+    if code == 400 {
+        return erreur_http(400, "Bad Request", "Requete malformee.", requete_id)
+    }
+    if code == 404 {
+        return erreur_http(404, "Not Found", "Ressource introuvable.", requete_id)
+    }
+    if code == 401 {
+        return erreur_http(401, "Unauthorized", "Authentification requise.", requete_id)
+    }
+    if code == 403 {
+        return erreur_http(403, "Forbidden", "Acces refuse.", requete_id)
+    }
+    if code == 405 {
+        return erreur_http(405, "Method Not Allowed", "Methode non autorisee.", requete_id)
+    }
+    if code == 408 {
+        return erreur_http(408, "Request Timeout", "Requete incomplete ou trop lente.", requete_id)
+    }
+    if code == 413 {
+        return erreur_http(413, "Payload Too Large", "Corps trop volumineux.", requete_id)
+    }
+    if code == 415 {
+        return erreur_http(415, "Unsupported Media Type", "Type de contenu non pris en charge.", requete_id)
+    }
+    if code == 422 {
+        return erreur_http(422, "Unprocessable Content", "Contenu invalide.", requete_id)
+    }
+    if code == 429 {
+        return erreur_http(429, "Too Many Requests", "Trop de requetes.", requete_id)
+    }
+    if code == 431 {
+        return erreur_http(431, "Request Header Fields Too Large", "En-tetes trop volumineux.", requete_id)
+    }
+    if code == 503 {
+        return erreur_http(503, "Service Unavailable", "Service temporairement indisponible.", requete_id)
+    }
+    return erreur_http(500, "Internal Server Error", "Erreur interne.", requete_id)
+}
+
+// Problem Details (RFC 9457/7807) sans divulguer de secret interne.
+fn reponse_problem(e: ErreurHttp) -> Reponse {
+    let corps = "{"
+        + "\"type\":\"about:blank\","
+        + "\"title\":" + json_texte(e.titre) + ","
+        + "\"status\":" + text(e.statut) + ","
+        + "\"detail\":" + json_texte(e.detail_public) + ","
+        + "\"request_id\":" + json_texte(e.requete_id)
+        + "}"
+    return reponse_new(e.statut, e.titre, "application/problem+json", corps)
+}
+
+fn requete_id(req: Requete) -> Text {
+    let fourni = requete_entete(req, "X-Request-Id")
+    if has(fourni) {
+        let v = unwrap_or(fourni, "")
+        if not has(find(v, "\r")) and not has(find(v, "\n")) and len(v) <= 128 {
+            return v
+        }
+    }
+    return sub(sha256_hex(bytes_from_text(req.methode + " " + req.chemin + "?" + req.query + "#" + req.corps)), 0, 16)
+}
+
+fn reponse_405(allow: Text) -> Reponse {
+    var r = reponse_problem(erreur_http_depuis_code(405, ""))
+    if allow != "" {
+        r = reponse_avec_entete(r, "Allow", allow)
+    }
+    return r
+}
+
+fn reponse_404(requete_id: Text) -> Reponse {
+    return reponse_problem(erreur_http_depuis_code(404, requete_id))
+}
+
+fn reponse_413(requete_id: Text) -> Reponse {
+    return reponse_problem(erreur_http_depuis_code(413, requete_id))
+}
+
+fn reponse_429(retry_after_secondes: Int, requete_id: Text) -> Reponse {
+    var r = reponse_problem(erreur_http_depuis_code(429, requete_id))
+    if retry_after_secondes >= 0 {
+        r = reponse_avec_entete(r, "Retry-After", text(retry_after_secondes))
+    }
+    return r
+}
+
+fn reponse_500(requete_id: Text) -> Reponse {
+    return reponse_problem(erreur_http_depuis_code(500, requete_id))
+}
+
+fn middleware_appliquer(req: Requete, rep: Reponse, middlewares: List<Fn(Requete, Reponse) -> Reponse>) -> Reponse {
+    var out = rep
+    for m in middlewares {
+        out = m(req, out)
+    }
+    return out
+}
+
+fn middleware_pre_appliquer(req: Requete, middlewares: List<Fn(Requete) -> Option<Reponse>>) -> Option<Reponse> {
+    for m in middlewares {
+        let rep = m(req)
+        if has(rep) {
+            return rep
+        }
+    }
+    return none
+}
+
+fn middleware_securite(_req: Requete, rep: Reponse) -> Reponse {
+    var r = reponse_avec_entete(rep, "X-Content-Type-Options", "nosniff")
+    r = reponse_avec_entete(r, "X-Frame-Options", "DENY")
+    r = reponse_avec_entete(r, "Referrer-Policy", "no-referrer")
+    r = reponse_avec_entete(r, "Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    r = reponse_avec_entete(r, "Content-Security-Policy", "default-src 'self'; object-src 'none'; base-uri 'self'; frame-ancestors 'none'")
+    return r
+}
+
+fn middleware_request_id(req: Requete, rep: Reponse) -> Reponse {
+    return reponse_avec_entete(rep, "X-Request-Id", requete_id(req))
+}
+
+fn middleware_no_cache(_req: Requete, rep: Reponse) -> Reponse {
+    return reponse_avec_entete(rep, "Cache-Control", "no-store")
+}
+
+fn web_log_json(req: Requete, rep: Reponse, duree_ms: Int) -> Text {
+    return "{"
+        + "\"ts_ms\":" + text(mono_ms()) + ","
+        + "\"request_id\":" + json_texte(requete_id(req)) + ","
+        + "\"method\":" + json_texte(req.methode) + ","
+        + "\"path\":" + json_texte(req.chemin) + ","
+        + "\"status\":" + text(rep.statut) + ","
+        + "\"duration_ms\":" + text(duree_ms)
+        + "}"
+}
+
+fn limiteur_debit(cle: Text, max_requetes: Int, fenetre_ms: Int, maintenant_ms: Int) -> LimiteurDebit {
+    return LimiteurDebit { cle: cle, fenetre_debut_ms: maintenant_ms, compteur: 0, max_requetes: max_requetes, fenetre_ms: fenetre_ms }
+}
+
+fn limiteur_autorise(l: LimiteurDebit, cle: Text, maintenant_ms: Int) -> Bool {
+    if cle != l.cle {
+        return true
+    }
+    if maintenant_ms - l.fenetre_debut_ms >= l.fenetre_ms {
+        return true
+    }
+    return l.compteur < l.max_requetes
+}
+
+fn limiteur_note(l: LimiteurDebit, cle: Text, maintenant_ms: Int) -> LimiteurDebit {
+    if cle != l.cle or maintenant_ms - l.fenetre_debut_ms >= l.fenetre_ms {
+        return LimiteurDebit { cle: cle, fenetre_debut_ms: maintenant_ms, compteur: 1, max_requetes: l.max_requetes, fenetre_ms: l.fenetre_ms }
+    }
+    return LimiteurDebit { cle: l.cle, fenetre_debut_ms: l.fenetre_debut_ms, compteur: l.compteur + 1, max_requetes: l.max_requetes, fenetre_ms: l.fenetre_ms }
+}
+
+fn limiteur_reponse_429(l: LimiteurDebit, requete_id: Text, maintenant_ms: Int) -> Reponse {
+    var reste = l.fenetre_ms - (maintenant_ms - l.fenetre_debut_ms)
+    if reste < 0 {
+        reste = 0
+    }
+    return reponse_429((reste + 999) / 1000, requete_id)
+}
+
+fn csrf_token(secret: Text, session_id: Text) -> Text {
+    return hmac_sha256_hex(bytes_from_text(secret), bytes_from_text(session_id))
+}
+
+fn csrf_verifie(secret: Text, session_id: Text, token: Text) -> Bool {
+    let attendu = hex_decode(csrf_token(secret, session_id))
+    let recu = hex_decode(token)
+    if not has(attendu) or not has(recu) {
+        return false
+    }
+    return bytes_egal_ct(unwrap_or(attendu, bytes_new()), unwrap_or(recu, bytes_new()))
+}
+
+fn requete_methode_sure(req: Requete) -> Bool {
+    return req.methode == "GET" or req.methode == "HEAD" or req.methode == "OPTIONS"
+}
+
+fn requete_csrf_valide(req: Requete, secret: Text, session_id: Text) -> Bool {
+    if requete_methode_sure(req) {
+        return true
+    }
+    var token = requete_entete(req, "X-CSRF-Token")
+    if not has(token) {
+        token = requete_form(req, "_csrf")
+    }
+    if not has(token) {
+        return false
+    }
+    return csrf_verifie(secret, session_id, unwrap_or(token, ""))
+}
+
+fn web_sans_guillemets(v: Text) -> Text {
+    if len(v) >= 2 and starts_with(v, "\"") and sub(v, len(v) - 1, 1) == "\"" {
+        return sub(v, 1, len(v) - 2)
+    }
+    return v
+}
+
+fn multipart_param(ligne: Text, nom: Text) -> Option<Text> {
+    let prefixe = nom + "="
+    for morceau in split(ligne, ";") {
+        let p = trim(morceau)
+        if starts_with(p, prefixe) {
+            let v = sub(p, len(prefixe), len(p) - len(prefixe))
+            if has(find(v, "\r")) or has(find(v, "\n")) {
+                return none
+            }
+            return some(web_sans_guillemets(v))
+        }
+    }
+    return none
+}
+
+fn multipart_entete(bloc: Text, nom: Text) -> Option<Text> {
+    let cible = lower(nom)
+    for ligne in split(bloc, "\r\n") {
+        let c = find(ligne, ":")
+        if has(c) {
+            let i = unwrap_or(c, 0)
+            if lower(trim(sub(ligne, 0, i))) == cible {
+                return some(trim(sub(ligne, i + 1, len(ligne) - i - 1)))
+            }
+        }
+    }
+    return none
+}
+
+fn requete_multipart_boundary(req: Requete) -> Option<Text> {
+    let ct = requete_entete(req, "Content-Type")
+    if not has(ct) {
+        return none
+    }
+    for morceau in split(unwrap_or(ct, ""), ";") {
+        let p = trim(morceau)
+        if starts_with(lower(p), "boundary=") {
+            let b = web_sans_guillemets(sub(p, 9, len(p) - 9))
+            if b == "" or has(find(b, "\r")) or has(find(b, "\n")) or has(find(b, "--")) {
+                return none
+            }
+            return some(b)
+        }
+    }
+    return none
+}
+
+fn requete_multipart(req: Requete, max_champs: Int, max_octets_par_champ: Int) -> Option<List<MultipartChamp>> {
+    let b = requete_multipart_boundary(req)
+    if not has(b) or max_champs < 0 or max_octets_par_champ < 0 {
+        return none
+    }
+    let marque = "--" + unwrap_or(b, "")
+    var champs: List<MultipartChamp> = []
+    var pos = 0
+    while true {
+        let m = web_find_depuis(req.corps, marque, pos)
+        if not has(m) {
+            return none
+        }
+        var debut = unwrap_or(m, 0) + len(marque)
+        if sub(req.corps, debut, 2) == "--" {
+            return some(champs)
+        }
+        if sub(req.corps, debut, 2) != "\r\n" {
+            return none
+        }
+        debut = debut + 2
+        let sep = web_find_depuis(req.corps, "\r\n\r\n", debut)
+        if not has(sep) {
+            return none
+        }
+        let fin_entetes = unwrap_or(sep, 0)
+        let entetes = sub(req.corps, debut, fin_entetes - debut)
+        let debut_contenu = fin_entetes + 4
+        let prochain = web_find_depuis(req.corps, "\r\n" + marque, debut_contenu)
+        if not has(prochain) {
+            return none
+        }
+        let fin_contenu = unwrap_or(prochain, 0)
+        let taille = fin_contenu - debut_contenu
+        if taille < 0 or taille > max_octets_par_champ or len(champs) >= max_champs {
+            return none
+        }
+        let dispo = multipart_entete(entetes, "Content-Disposition")
+        if not has(dispo) {
+            return none
+        }
+        let nom = multipart_param(unwrap_or(dispo, ""), "name")
+        if not has(nom) {
+            return none
+        }
+        let fichier = unwrap_or(multipart_param(unwrap_or(dispo, ""), "filename"), "")
+        let type_contenu = unwrap_or(multipart_entete(entetes, "Content-Type"), "")
+        push(champs, MultipartChamp { nom: unwrap_or(nom, ""), fichier: fichier, type_contenu: type_contenu, contenu: sub(req.corps, debut_contenu, taille) })
+        pos = fin_contenu + 2
+    }
+    return none
+}
+
+fn multipart_valeur(champs: List<MultipartChamp>, nom: Text) -> Option<Text> {
+    for c in champs {
+        if c.nom == nom and c.fichier == "" {
+            return some(c.contenu)
+        }
+    }
+    return none
+}
+
+fn multipart_fichier(champs: List<MultipartChamp>, nom: Text) -> Option<MultipartChamp> {
+    for c in champs {
+        if c.nom == nom and c.fichier != "" {
+            return some(c)
+        }
+    }
+    return none
+}
+
+fn session_signe_message(s: SessionSigne) -> Text {
+    return s.sujet + "|" + text(s.expiration) + "|" + s.nonce
+}
+
+fn session_signe(secret: Text, sujet: Text, duree_secondes: Int, maintenant: Int) -> Option<Text> {
+    if secret == "" or sujet == "" or has(find(sujet, "|")) or duree_secondes <= 0 or maintenant < 0 {
+        return none
+    }
+    if maintenant > 9223372036854775807 - duree_secondes {
+        return none
+    }
+    let nonce = random_hex(16)
+    if not has(nonce) {
+        return none
+    }
+    let s = SessionSigne { sujet: sujet, expiration: maintenant + duree_secondes, nonce: unwrap_or(nonce, "") }
+    let message = session_signe_message(s)
+    let signature = hmac_sha256_hex(bytes_from_text(secret), bytes_from_text(message))
+    return some(message + "|" + signature)
+}
+
+// L'epoch est fourni par l'appelant pour rendre la verification deterministe.
+fn session_verifie(secret: Text, token: Text, maintenant: Int) -> Option<SessionSigne> {
+    if secret == "" or maintenant < 0 or len(token) > 4096 {
+        return none
+    }
+    let morceaux = split(token, "|")
+    if len(morceaux) != 4 {
+        return none
+    }
+    let sujet = get(morceaux, 0)
+    let expiration = parse_int(get(morceaux, 1))
+    let nonce = get(morceaux, 2)
+    let recu = get(morceaux, 3)
+    if sujet == "" or len(nonce) != 32 or len(recu) != 64 or not has(expiration) {
+        return none
+    }
+    let s = SessionSigne { sujet: sujet, expiration: unwrap_or(expiration, 0), nonce: nonce }
+    if s.expiration <= maintenant {
+        return none
+    }
+    let attendu = hmac_sha256_hex(bytes_from_text(secret), bytes_from_text(session_signe_message(s)))
+    let attendu_b = hex_decode(attendu)
+    let recu_b = hex_decode(recu)
+    if not has(attendu_b) or not has(recu_b) {
+        return none
+    }
+    if not bytes_egal_ct(unwrap_or(attendu_b, bytes_new()), unwrap_or(recu_b, bytes_new())) {
+        return none
+    }
+    return some(s)
+}
+
+fn session_cookie(secret: Text, sujet: Text, duree_secondes: Int, maintenant: Int) -> Option<Text> {
+    let token = session_signe(secret, sujet, duree_secondes, maintenant)
+    if not has(token) {
+        return none
+    }
+    return some("nol_session=" + unwrap_or(token, "") + "; Path=/; HttpOnly; Secure; SameSite=Lax")
+}
+
+fn session_cle_message(s: SessionSigneCle) -> Text {
+    return s.kid + "|" + s.sujet + "|" + text(s.expiration) + "|" + s.nonce
+}
+
+fn session_signe_cle(kid: Text, secret: Text, sujet: Text, duree_secondes: Int, maintenant: Int, max_sujet: Int) -> Option<Text> {
+    if kid == "" or secret == "" or sujet == "" or duree_secondes <= 0 or maintenant < 0 or max_sujet <= 0 {
+        return none
+    }
+    if maintenant > 9223372036854775807 - duree_secondes {
+        return none
+    }
+    if len(sujet) > max_sujet or has(find(kid, "|")) or has(find(sujet, "|")) {
+        return none
+    }
+    let nonce = random_hex(16)
+    if not has(nonce) {
+        return none
+    }
+    let s = SessionSigneCle { kid: kid, sujet: sujet, expiration: maintenant + duree_secondes, nonce: unwrap_or(nonce, "") }
+    let message = session_cle_message(s)
+    let signature = hmac_sha256_hex(bytes_from_text(secret), bytes_from_text(message))
+    return some(message + "|" + signature)
+}
+
+fn session_verifie_cle(kids: List<Text>, secrets: List<Text>, token: Text, maintenant: Int) -> Option<SessionSigneCle> {
+    if maintenant < 0 or len(token) > 4096 {
+        return none
+    }
+    let morceaux = split(token, "|")
+    if len(morceaux) != 5 or len(kids) != len(secrets) {
+        return none
+    }
+    let kid = get(morceaux, 0)
+    let sujet = get(morceaux, 1)
+    let expiration = parse_int(get(morceaux, 2))
+    let nonce = get(morceaux, 3)
+    let recu = get(morceaux, 4)
+    if kid == "" or sujet == "" or len(nonce) != 32 or len(recu) != 64 or not has(expiration) {
+        return none
+    }
+    let s = SessionSigneCle { kid: kid, sujet: sujet, expiration: unwrap_or(expiration, 0), nonce: nonce }
+    if s.expiration <= maintenant {
+        return none
+    }
+    var secret = ""
+    var trouve = false
+    var i = 0
+    while i < len(kids) {
+        if get(kids, i) == kid {
+            secret = get(secrets, i)
+            trouve = true
+        }
+        i = i + 1
+    }
+    if not trouve {
+        return none
+    }
+    let attendu = hmac_sha256_hex(bytes_from_text(secret), bytes_from_text(session_cle_message(s)))
+    let attendu_b = hex_decode(attendu)
+    let recu_b = hex_decode(recu)
+    if not has(attendu_b) or not has(recu_b) {
+        return none
+    }
+    if not bytes_egal_ct(unwrap_or(attendu_b, bytes_new()), unwrap_or(recu_b, bytes_new())) {
+        return none
+    }
+    return some(s)
+}
+
+fn session_cookie_cle(kid: Text, secret: Text, sujet: Text, duree_secondes: Int, maintenant: Int, max_sujet: Int, same_site: Text) -> Option<Text> {
+    let token = session_signe_cle(kid, secret, sujet, duree_secondes, maintenant, max_sujet)
+    if not has(token) {
+        return none
+    }
+    var ss = "Lax"
+    if same_site == "Strict" or same_site == "Lax" or same_site == "None" {
+        ss = same_site
+    }
+    return some("nol_session=" + unwrap_or(token, "") + "; Path=/; HttpOnly; Secure; SameSite=" + ss)
+}
+
+// Parse une requête et exécute le handler dans une sous-région lexicale.
+// La réponse rendue est copiée avant libération de la région, ce qui borne la
+// mémoire par requête sans laisser sortir de références internes.
+fn web_repondre_region(buf: Text, max_entetes: Int, max_corps: Int, handler: Fn(Requete) -> Reponse) -> Text {
+    region {
+        let analyse = http_analyser(buf, max_entetes, max_corps)
+        match analyse {
+            Complet(req) => return reponse_rendu(handler(req))
+            Incomplet => return reponse_rendu(reponse_new(408, "Request Timeout", "text/plain; charset=utf-8", "requete incomplete"))
+            Erreur(code) => return reponse_rendu(reponse_erreur(code))
+        }
+    }
+    return reponse_rendu(reponse_erreur(500))
+}
+
+fn web_repondre_resultat(buf: Text, limites: WebLimites, handler: Fn(Requete) -> WebResultat, middlewares: List<Fn(Requete, Reponse) -> Reponse>) -> Text {
+    region {
+        let analyse = http_analyser(buf, limites.max_entetes, limites.max_corps)
+        match analyse {
+            Complet(req) => {
+                let resultat = handler(req)
+                match resultat {
+                    WebOk(rep) => return reponse_rendu(middleware_appliquer(req, rep, middlewares))
+                    WebEchec(err) => return reponse_rendu(middleware_appliquer(req, reponse_problem(err), middlewares))
+                }
+            }
+            Incomplet => return reponse_rendu(reponse_problem(erreur_http_depuis_code(408, "")))
+            Erreur(code) => return reponse_rendu(reponse_problem(erreur_http_depuis_code(code, "")))
+        }
+    }
+    return reponse_rendu(reponse_problem(erreur_http_depuis_code(500, "")))
+}
+
+fn web_repondre_resultat_pre(buf: Text, limites: WebLimites, handler: Fn(Requete) -> WebResultat, pre: List<Fn(Requete) -> Option<Reponse>>, post: List<Fn(Requete, Reponse) -> Reponse>) -> Text {
+    region {
+        let analyse = http_analyser(buf, limites.max_entetes, limites.max_corps)
+        match analyse {
+            Complet(req) => {
+                let bloque = middleware_pre_appliquer(req, pre)
+                if has(bloque) {
+                    return reponse_rendu(middleware_appliquer(req, unwrap_or(bloque, reponse_erreur(500)), post))
+                }
+                let resultat = handler(req)
+                match resultat {
+                    WebOk(rep) => return reponse_rendu(middleware_appliquer(req, rep, post))
+                    WebEchec(err) => return reponse_rendu(middleware_appliquer(req, reponse_problem(err), post))
+                }
+            }
+            Incomplet => return reponse_rendu(reponse_problem(erreur_http_depuis_code(408, "")))
+            Erreur(code) => return reponse_rendu(reponse_problem(erreur_http_depuis_code(code, "")))
+        }
+    }
+    return reponse_rendu(reponse_problem(erreur_http_depuis_code(500, "")))
+}
+
+fn web_traiter_requete(req: Requete, handler: Fn(Requete) -> WebResultat, pre: List<Fn(Requete) -> Option<Reponse>>, post: List<Fn(Requete, Reponse) -> Reponse>) -> Reponse {
+    let bloque = middleware_pre_appliquer(req, pre)
+    if has(bloque) {
+        return middleware_appliquer(req, unwrap_or(bloque, reponse_erreur(500)), post)
+    }
+    match handler(req) {
+        WebOk(rep) => return middleware_appliquer(req, rep, post)
+        WebEchec(err) => return middleware_appliquer(req, reponse_problem(err), post)
+    }
+    return middleware_appliquer(req, reponse_500(requete_id(req)), post)
+}
+
+// Réponse d'erreur standard à partir d'un code du parseur.
+fn reponse_erreur(code: Int) -> Reponse {
+    if code == 400 {
+        return reponse_new(400, "Bad Request", "text/html; charset=utf-8", "<h1>400</h1><p>Requete malformee.</p>")
+    }
+    if code == 413 {
+        return reponse_new(413, "Payload Too Large", "text/html; charset=utf-8", "<h1>413</h1><p>Corps trop volumineux.</p>")
+    }
+    if code == 431 {
+        return reponse_new(431, "Request Header Fields Too Large", "text/html; charset=utf-8", "<h1>431</h1><p>En-tetes trop volumineux.</p>")
+    }
+    return reponse_new(code, "Error", "text/html; charset=utf-8", "<h1>" + text(code) + "</h1>")
+}
+
+// Variante stricte du routeur brut : 404 si chemin inconnu, 405 si le chemin
+// existe pour une autre méthode. `Allow` liste les méthodes enregistrées.
+fn routeur_dispatch_strict(methodes: List<Text>, chemins: List<Text>, handlers: List<Fn(Text) -> Text>, requete: Text) -> Text {
+    let m = req_methode(requete)
+    let ch = req_chemin(requete)
+    var allow = ""
+    var i = 0
+    while i < len(chemins) {
+        if get(chemins, i) == ch {
+            let methode = get(methodes, i)
+            if methode == m {
+                let h = get(handlers, i)
+                return h(requete)
+            }
+            if allow != "" {
+                allow += ", "
+            }
+            allow += methode
+        }
+        i = i + 1
+    }
+    if allow != "" {
+        return reponse_rendu(reponse_405(allow))
+    }
+    return reponse_rendu(reponse_erreur(404))
+}
+
+fn web_reponse_valide(r: Reponse) -> Bool {
+    if r.statut < 100 or r.statut > 599 or r.statut_texte == "" or r.type_contenu == "" {
+        return false
+    }
+    if has(find(r.statut_texte, "\r")) or has(find(r.statut_texte, "\n")) or has(find(r.type_contenu, "\r")) or has(find(r.type_contenu, "\n")) {
+        return false
+    }
+    let sans_lignes = replace(r.entetes, "\r\n", "")
+    return not has(find(sans_lignes, "\r")) and not has(find(sans_lignes, "\n"))
+}
+
+fn requete_keep_alive(req: Requete) -> Bool {
+    let connexion = lower(unwrap_or(requete_entete(req, "Connection"), ""))
+    if req.version == "HTTP/1.1" {
+        return connexion != "close"
+    }
+    return connexion == "keep-alive"
+}
+
+fn reponse_rendu_connexion_methode(r: Reponse, keep_alive: Bool, keep_alive_ms: Int, restantes: Int, methode: Text) -> Text {
+    if not web_reponse_valide(r) {
+        return "HTTP/1.1 500 Internal Server Error\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 15\r\nConnection: close\r\n\r\nErreur interne."
+    }
+    var s = "HTTP/1.1 " + text(r.statut) + " " + r.statut_texte + "\r\n"
+    s += "Server: nolc-web\r\n"
+    s += "Content-Type: " + r.type_contenu + "\r\n"
+    s += "Content-Length: " + text(len(r.corps)) + "\r\n"
+    if r.entetes != "" {
+        s += r.entetes + "\r\n"
+    }
+    if keep_alive {
+        s += "Connection: keep-alive\r\n"
+        s += "Keep-Alive: timeout=" + text((keep_alive_ms + 999) / 1000) + ", max=" + text(restantes) + "\r\n\r\n"
+    } else {
+        s += "Connection: close\r\n\r\n"
+    }
+    if r.statut != 204 and r.statut != 304 and methode != "HEAD" {
+        s += r.corps
+    }
+    return s
+}
+
+fn reponse_rendu_connexion(r: Reponse, keep_alive: Bool, keep_alive_ms: Int, restantes: Int) -> Text {
+    return reponse_rendu_connexion_methode(r, keep_alive, keep_alive_ms, restantes, "")
+}
+
+// Sérialise une Reponse en trame HTTP/1.1 complète (Connection: close).
+fn reponse_rendu(r: Reponse) -> Text {
+    return reponse_rendu_connexion(r, false, 0, 0)
+}
+
+// ---------- Fichiers statiques (JS, CSS, images...) ----------
+
+fn type_mime(chemin: Text) -> Text {
+    if contains(chemin, ".html") {
+        return "text/html; charset=utf-8"
+    }
+    if contains(chemin, ".css") {
+        return "text/css"
+    }
+    if contains(chemin, ".js") {
+        return "application/javascript"
+    }
+    if contains(chemin, ".json") {
+        return "application/json"
+    }
+    if contains(chemin, ".svg") {
+        return "image/svg+xml"
+    }
+    if contains(chemin, ".png") {
+        return "image/png"
+    }
+    if contains(chemin, ".jpg") or contains(chemin, ".jpeg") {
+        return "image/jpeg"
+    }
+    if contains(chemin, ".webp") {
+        return "image/webp"
+    }
+    if contains(chemin, ".woff2") {
+        return "font/woff2"
+    }
+    if contains(chemin, ".ico") {
+        return "image/x-icon"
+    }
+    return "application/octet-stream"
+}
+
+fn chemin_statique_sur(chemin_url: Text) -> Option<Text> {
+    let decode = url_decode(chemin_url)
+    if not starts_with(decode, "/") or contains(decode, "\\") or contains(decode, "\r") or contains(decode, "\n") {
+        return none
+    }
+    for segment in split(decode, "/") {
+        if segment == ".." or segment == "." {
+            return none
+        }
+    }
+    return some(decode)
+}
+
+// Sert un fichier statique depuis `racine`, chemin relatif issu de l'URL.
+// Refuse la traversée de répertoire. none si absent.
+fn servir_statique(racine: Text, chemin_url: Text) -> Option<Text> {
+    let sur = chemin_statique_sur(chemin_url)
+    if not has(sur) {
+        return none
+    }
+    let complet = racine + unwrap_or(sur, "")
+    let c = file_read(complet)
+    if not has(c) {
+        return none
+    }
+    return some(rep_statut(200, "OK", type_mime(chemin_url), unwrap_or(c, "")))
+}

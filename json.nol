@@ -1,0 +1,647 @@
+// JSON pour Nolc : construction sûre et extraction de champs plats.
+//
+// Nolc n'a pas encore de type somme récursif : un DOM JSON arbitraire
+// n'est donc pas représentable. Ce module couvre les besoins réels des
+// API et configs : construire du JSON valide (échappement automatique) et
+// lire les champs de premier niveau d'un objet. Renvoie des Option, jamais
+// de sentinelle.
+
+// Échappe un texte pour l'insérer dans du JSON (entre guillemets inclus).
+fn json_texte(valeur: Text) -> Text {
+    var out = "\""
+    var i = 0
+    while i < len(valeur) {
+        let c = sub(valeur, i, 1)
+        if c == "\"" {
+            out = out + "\\\""
+        } else if c == "\\" {
+            out = out + "\\\\"
+        } else if c == "\n" {
+            out = out + "\\n"
+        } else if c == "\t" {
+            out = out + "\\t"
+        } else if c == "\r" {
+            out = out + "\\r"
+        } else {
+            let octets = bytes_from_text(c)
+            if len(octets) > 0 and bytes_get(octets, 0) < 32 {
+                let n = bytes_get(octets, 0)
+                out = out + "\\u00" + sub("0123456789abcdef", n / 16, 1) + sub("0123456789abcdef", n % 16, 1)
+            } else {
+                out = out + c
+            }
+        }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn json_int(valeur: Int) -> Text {
+    return text(valeur)
+}
+
+fn json_bool(valeur: Bool) -> Text {
+    if valeur {
+        return "true"
+    }
+    return "false"
+}
+
+fn json_null() -> Text {
+    return "null"
+}
+
+fn json_chiffre(c: Text) -> Bool {
+    return len(c) == 1 and has(parse_int(c))
+}
+
+fn json_hex(c: Text) -> Bool {
+    return contains("0123456789abcdef", lower(c))
+}
+
+fn json_parse_chaine_fin(source: Text, depart: Int) -> Option<Int> {
+    if depart >= len(source) or sub(source, depart, 1) != "\"" {
+        return none
+    }
+    var i = depart + 1
+    while i < len(source) {
+        let c = sub(source, i, 1)
+        if c == "\"" {
+            return some(i + 1)
+        }
+        let octets = bytes_from_text(c)
+        if len(octets) > 0 and bytes_get(octets, 0) < 32 {
+            return none
+        }
+        if c == "\\" {
+            if i + 1 >= len(source) {
+                return none
+            }
+            let e = sub(source, i + 1, 1)
+            if contains("\"\\/bfnrt", e) {
+                i += 2
+                continue
+            }
+            if e == "u" {
+                if i + 5 >= len(source) {
+                    return none
+                }
+                var j = 0
+                while j < 4 {
+                    if not json_hex(sub(source, i + 2 + j, 1)) {
+                        return none
+                    }
+                    j += 1
+                }
+                i += 6
+                continue
+            }
+            return none
+        }
+        i += 1
+    }
+    return none
+}
+
+fn json_parse_nombre_fin(source: Text, depart: Int) -> Option<Int> {
+    var i = depart
+    if i < len(source) and sub(source, i, 1) == "-" {
+        i += 1
+    }
+    if i >= len(source) {
+        return none
+    }
+    if sub(source, i, 1) == "0" {
+        i += 1
+        if i < len(source) and json_chiffre(sub(source, i, 1)) {
+            return none
+        }
+    } else {
+        if not contains("123456789", sub(source, i, 1)) {
+            return none
+        }
+        while i < len(source) and json_chiffre(sub(source, i, 1)) {
+            i += 1
+        }
+    }
+    if i < len(source) and sub(source, i, 1) == "." {
+        i += 1
+        let debut_fraction = i
+        while i < len(source) and json_chiffre(sub(source, i, 1)) {
+            i += 1
+        }
+        if i == debut_fraction {
+            return none
+        }
+    }
+    if i < len(source) and (sub(source, i, 1) == "e" or sub(source, i, 1) == "E") {
+        i += 1
+        if i < len(source) and (sub(source, i, 1) == "+" or sub(source, i, 1) == "-") {
+            i += 1
+        }
+        let debut_exposant = i
+        while i < len(source) and json_chiffre(sub(source, i, 1)) {
+            i += 1
+        }
+        if i == debut_exposant {
+            return none
+        }
+    }
+    return some(i)
+}
+
+fn json_parse_valeur_fin(source: Text, depart: Int, profondeur: Int) -> Option<Int> {
+    if profondeur > 128 {
+        return none
+    }
+    let i = json_saute_espaces(source, depart)
+    if i >= len(source) {
+        return none
+    }
+    let premier = sub(source, i, 1)
+    if premier == "\"" {
+        return json_parse_chaine_fin(source, i)
+    }
+    if premier == "{" {
+        var pos = json_saute_espaces(source, i + 1)
+        if pos < len(source) and sub(source, pos, 1) == "}" {
+            return some(pos + 1)
+        }
+        while pos < len(source) {
+            let fin_cle = json_parse_chaine_fin(source, pos)
+            if not has(fin_cle) {
+                return none
+            }
+            pos = json_saute_espaces(source, unwrap_or(fin_cle, pos))
+            if pos >= len(source) or sub(source, pos, 1) != ":" {
+                return none
+            }
+            let fin_valeur = json_parse_valeur_fin(source, pos + 1, profondeur + 1)
+            if not has(fin_valeur) {
+                return none
+            }
+            pos = json_saute_espaces(source, unwrap_or(fin_valeur, pos))
+            if pos < len(source) and sub(source, pos, 1) == "}" {
+                return some(pos + 1)
+            }
+            if pos >= len(source) or sub(source, pos, 1) != "," {
+                return none
+            }
+            pos = json_saute_espaces(source, pos + 1)
+        }
+        return none
+    }
+    if premier == "[" {
+        var pos = json_saute_espaces(source, i + 1)
+        if pos < len(source) and sub(source, pos, 1) == "]" {
+            return some(pos + 1)
+        }
+        while pos < len(source) {
+            let fin_valeur = json_parse_valeur_fin(source, pos, profondeur + 1)
+            if not has(fin_valeur) {
+                return none
+            }
+            pos = json_saute_espaces(source, unwrap_or(fin_valeur, pos))
+            if pos < len(source) and sub(source, pos, 1) == "]" {
+                return some(pos + 1)
+            }
+            if pos >= len(source) or sub(source, pos, 1) != "," {
+                return none
+            }
+            pos = json_saute_espaces(source, pos + 1)
+        }
+        return none
+    }
+    if starts_with(sub(source, i, len(source) - i), "true") {
+        return some(i + 4)
+    }
+    if starts_with(sub(source, i, len(source) - i), "false") {
+        return some(i + 5)
+    }
+    if starts_with(sub(source, i, len(source) - i), "null") {
+        return some(i + 4)
+    }
+    return json_parse_nombre_fin(source, i)
+}
+
+fn json_valide(source: Text) -> Bool {
+    let fin = json_parse_valeur_fin(source, 0, 0)
+    if not has(fin) {
+        return false
+    }
+    return json_saute_espaces(source, unwrap_or(fin, 0)) == len(source)
+}
+
+fn json_liste_textes(valeurs: List<Text>) -> Text {
+    var out = "["
+    var i = 0
+    while i < len(valeurs) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + json_texte(get(valeurs, i))
+        i = i + 1
+    }
+    return out + "]"
+}
+
+fn json_liste_ints(valeurs: List<Int>) -> Text {
+    var out = "["
+    var i = 0
+    while i < len(valeurs) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + text(get(valeurs, i))
+        i = i + 1
+    }
+    return out + "]"
+}
+
+fn json_objet_champs(cles: List<Text>, valeurs_json: List<Text>) -> Option<Text> {
+    if len(cles) != len(valeurs_json) {
+        return none
+    }
+    var out = "{"
+    var i = 0
+    while i < len(cles) {
+        if i > 0 {
+            out = out + ","
+        }
+        out = out + json_texte(get(cles, i)) + ":" + get(valeurs_json, i)
+        i = i + 1
+    }
+    return some(out + "}")
+}
+
+// --- extraction de champs de premier niveau ---
+
+// Valeur brute (non désérialisée) associée à une clé, ou none si absente.
+// Gère les valeurs Text ("..."), nombres, true/false, null.
+fn json_brut(source: Text, cle: Text) -> Option<Text> {
+    let motif = json_texte(cle) + ":"
+    let pos = find(source, motif)
+    if not has(pos) {
+        // tolère une espace après les deux-points : "cle" :
+        let motif2 = json_texte(cle) + " :"
+        let p2 = find(source, motif2)
+        if not has(p2) {
+            return none
+        }
+        return json_valeur_a(source, unwrap_or(p2, 0) + len(motif2))
+    }
+    return json_valeur_a(source, unwrap_or(pos, 0) + len(motif))
+}
+
+// Lit la valeur JSON qui commence à l'indice donné (après ':').
+fn json_valeur_a(source: Text, depart: Int) -> Option<Text> {
+    var i = depart
+    // saute les espaces
+    while i < len(source) and sub(source, i, 1) == " " {
+        i = i + 1
+    }
+    if i >= len(source) {
+        return none
+    }
+    let premier = sub(source, i, 1)
+    if premier == "\"" {
+        // chaîne : jusqu'au guillemet non échappé
+        var j = i + 1
+        var res = ""
+        var fini = false
+        while j < len(source) and not fini {
+            let c = sub(source, j, 1)
+            if c == "\\" and j + 1 < len(source) {
+                let suivant = sub(source, j + 1, 1)
+                if suivant == "n" {
+                    res = res + "\n"
+                } else if suivant == "t" {
+                    res = res + "\t"
+                } else {
+                    res = res + suivant
+                }
+                j = j + 2
+            } else if c == "\"" {
+                fini = true
+            } else {
+                res = res + c
+                j = j + 1
+            }
+        }
+        return some(res)
+    }
+    // scalaire : jusqu'à , } ] ou espace
+    var k = i
+    var brut = ""
+    var stop = false
+    while k < len(source) and not stop {
+        let c = sub(source, k, 1)
+        if c == "," or c == "}" or c == "]" or c == " " or c == "\n" {
+            stop = true
+        } else {
+            brut = brut + c
+            k = k + 1
+        }
+    }
+    return some(brut)
+}
+
+fn json_texte_champ(source: Text, cle: Text) -> Option<Text> {
+    return json_brut(source, cle)
+}
+
+fn json_int_champ(source: Text, cle: Text) -> Option<Int> {
+    let b = json_brut(source, cle)
+    if not has(b) {
+        return none
+    }
+    return parse_int(unwrap_or(b, ""))
+}
+
+fn json_bool_champ(source: Text, cle: Text) -> Option<Bool> {
+    let b = json_brut(source, cle)
+    if not has(b) {
+        return none
+    }
+    let v = unwrap_or(b, "")
+    if v == "true" {
+        return some(true)
+    }
+    if v == "false" {
+        return some(false)
+    }
+    return none
+}
+
+fn json_texte_chemin(source: Text, chemin: List<Text>) -> Option<Text> {
+    if len(chemin) == 0 {
+        return none
+    }
+    var courant = source
+    var i = 0
+    while i < len(chemin) {
+        let v = json_brut(courant, get(chemin, i))
+        if not has(v) {
+            return none
+        }
+        courant = unwrap_or(v, "")
+        i = i + 1
+    }
+    return some(courant)
+}
+
+fn json_int_chemin(source: Text, chemin: List<Text>) -> Option<Int> {
+    let v = json_texte_chemin(source, chemin)
+    if not has(v) {
+        return none
+    }
+    return parse_int(unwrap_or(v, ""))
+}
+
+// --- accès par chemin, sans type récursif (pur balayage de texte) ---
+//
+// Faute de DOM JSON (pas de type somme récursif dans Nolc), on navigue
+// dans une valeur imbriquée en ré-extrayant, à chaque étape, la sous-valeur
+// BRUTE (objet, tableau, chaîne ou scalaire) puis en repartant de là.
+// Le balayage est conscient des chaînes : un « { », « } », « [ », « ] »
+// à l'intérieur d'une chaîne JSON n'est jamais compté comme structure.
+
+// Vrai si le caractère est un blanc JSON.
+fn json_est_espace(c: Text) -> Bool {
+    return c == " " or c == "\t" or c == "\n" or c == "\r"
+}
+
+// Premier indice non blanc à partir de « depart ».
+fn json_saute_espaces(source: Text, depart: Int) -> Int {
+    var i = depart
+    while i < len(source) and json_est_espace(sub(source, i, 1)) {
+        i = i + 1
+    }
+    return i
+}
+
+// « depart » pointe sur le guillemet ouvrant : renvoie l'indice JUSTE APRÈS
+// le guillemet fermant (respecte les échappements « \" », « \\ »...).
+fn json_fin_chaine(source: Text, depart: Int) -> Int {
+    var j = depart + 1
+    var fini = false
+    while j < len(source) and not fini {
+        let c = sub(source, j, 1)
+        if c == "\\" {
+            j = j + 2
+        } else if c == "\"" {
+            j = j + 1
+            fini = true
+        } else {
+            j = j + 1
+        }
+    }
+    return j
+}
+
+// Indice de fin (exclu) de la valeur JSON qui commence à « depart »
+// (blancs de tête tolérés). Gère chaîne, objet, tableau et scalaire, en
+// équilibrant les accolades/crochets tout en ignorant ceux des chaînes.
+fn json_fin_valeur(source: Text, depart: Int) -> Int {
+    let i = json_saute_espaces(source, depart)
+    if i >= len(source) {
+        return i
+    }
+    let premier = sub(source, i, 1)
+    if premier == "\"" {
+        return json_fin_chaine(source, i)
+    }
+    if premier == "{" or premier == "[" {
+        var profondeur = 0
+        var j = i
+        var fini = false
+        while j < len(source) and not fini {
+            let c = sub(source, j, 1)
+            if c == "\"" {
+                j = json_fin_chaine(source, j)
+            } else if c == "{" or c == "[" {
+                profondeur = profondeur + 1
+                j = j + 1
+            } else if c == "}" or c == "]" {
+                profondeur = profondeur - 1
+                j = j + 1
+                if profondeur == 0 {
+                    fini = true
+                }
+            } else {
+                j = j + 1
+            }
+        }
+        return j
+    }
+    // scalaire : jusqu'à , } ] ou un blanc
+    var k = i
+    var stop = false
+    while k < len(source) and not stop {
+        let c = sub(source, k, 1)
+        if c == "," or c == "}" or c == "]" or json_est_espace(c) {
+            stop = true
+        } else {
+            k = k + 1
+        }
+    }
+    return k
+}
+
+// Sous-valeur JSON brute (non désérialisée) à l'indice donné, ou none.
+fn json_valeur_brute_a(source: Text, depart: Int) -> Option<Text> {
+    let debut = json_saute_espaces(source, depart)
+    if debut >= len(source) {
+        return none
+    }
+    let fin = json_fin_valeur(source, debut)
+    return some(sub(source, debut, fin - debut))
+}
+
+// Valeur BRUTE associée à une clé dans un objet JSON, en ne considérant que
+// les clés de PREMIER niveau de cet objet (contrairement à json_brut qui
+// cherche le motif n'importe où). none si la clé est absente.
+fn json_objet_valeur(objet: Text, cle: Text) -> Option<Text> {
+    let cible = json_texte(cle)
+    // se placer juste après la première accolade ouvrante
+    var i = 0
+    while i < len(objet) and sub(objet, i, 1) != "{" {
+        i = i + 1
+    }
+    if i >= len(objet) {
+        return none
+    }
+    i = i + 1
+    var actif = true
+    while actif {
+        i = json_saute_espaces(objet, i)
+        if i >= len(objet) {
+            actif = false
+        } else if sub(objet, i, 1) == "}" {
+            actif = false
+        } else if sub(objet, i, 1) != "\"" {
+            // objet mal formé : on s'arrête proprement
+            actif = false
+        } else {
+            let fin_cle = json_fin_chaine(objet, i)
+            let cle_brute = sub(objet, i, fin_cle - i)
+            let apres = json_saute_espaces(objet, fin_cle)
+            if apres >= len(objet) or sub(objet, apres, 1) != ":" {
+                actif = false
+            } else {
+                let debut_val = json_saute_espaces(objet, apres + 1)
+                let fin_val = json_fin_valeur(objet, debut_val)
+                if cle_brute == cible {
+                    return some(sub(objet, debut_val, fin_val - debut_val))
+                }
+                i = json_saute_espaces(objet, fin_val)
+                if i < len(objet) and sub(objet, i, 1) == "," {
+                    i = i + 1
+                } else {
+                    actif = false
+                }
+            }
+        }
+    }
+    return none
+}
+
+// Nième élément (0-indexé) d'un tableau JSON, valeur BRUTE, ou none si
+// l'indice est hors borne ou la source n'est pas un tableau.
+fn json_element_a(tableau: Text, index: Int) -> Option<Text> {
+    if index < 0 {
+        return none
+    }
+    var i = 0
+    while i < len(tableau) and sub(tableau, i, 1) != "[" {
+        i = i + 1
+    }
+    if i >= len(tableau) {
+        return none
+    }
+    i = i + 1
+    var idx = 0
+    var actif = true
+    while actif {
+        i = json_saute_espaces(tableau, i)
+        if i >= len(tableau) or sub(tableau, i, 1) == "]" {
+            actif = false
+        } else {
+            let debut_val = i
+            let fin_val = json_fin_valeur(tableau, debut_val)
+            if idx == index {
+                return some(sub(tableau, debut_val, fin_val - debut_val))
+            }
+            i = json_saute_espaces(tableau, fin_val)
+            if i < len(tableau) and sub(tableau, i, 1) == "," {
+                i = i + 1
+                idx = idx + 1
+            } else {
+                actif = false
+            }
+        }
+    }
+    return none
+}
+
+// Applique un segment de chemin à la valeur courante : indice de tableau si
+// la valeur est un tableau (« [ »), sinon clé d'objet.
+fn json_etape(courant: Text, segment: Text) -> Option<Text> {
+    let d = json_saute_espaces(courant, 0)
+    if d < len(courant) and sub(courant, d, 1) == "[" {
+        let idx = parse_int(segment)
+        if not has(idx) {
+            return none
+        }
+        return json_element_a(courant, unwrap_or(idx, 0))
+    }
+    return json_objet_valeur(courant, segment)
+}
+
+// Sous-valeur JSON BRUTE au chemin donné. Le chemin est une suite de
+// segments séparés par « . » : clé d'objet ou indice de tableau.
+// Exemple : json_chemin(rep, "choices.0.messages.0.content").
+// none si un segment est vide ou introuvable.
+fn json_chemin(source: Text, chemin: Text) -> Option<Text> {
+    let n = len(chemin)
+    var courant = source
+    var seg = ""
+    var i = 0
+    while i <= n {
+        let fin_seg = i == n
+        if fin_seg or sub(chemin, i, 1) == "." {
+            if len(seg) == 0 {
+                return none
+            }
+            let etape = json_etape(courant, seg)
+            if not has(etape) {
+                return none
+            }
+            courant = unwrap_or(etape, "")
+            seg = ""
+        } else {
+            seg = seg + sub(chemin, i, 1)
+        }
+        i = i + 1
+    }
+    return some(courant)
+}
+
+// json_chemin puis dé-quote/dé-échappe si la valeur est une chaîne
+// (réutilise json_valeur_a). Un scalaire est renvoyé tel quel.
+fn json_chemin_texte(source: Text, chemin: Text) -> Option<Text> {
+    let brut = json_chemin(source, chemin)
+    if not has(brut) {
+        return none
+    }
+    return json_valeur_a(unwrap_or(brut, ""), 0)
+}
+
+// json_chemin puis parse_int. none si absent ou non entier.
+fn json_chemin_int(source: Text, chemin: Text) -> Option<Int> {
+    let brut = json_chemin(source, chemin)
+    if not has(brut) {
+        return none
+    }
+    return parse_int(unwrap_or(brut, ""))
+}
