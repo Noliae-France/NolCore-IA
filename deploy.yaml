@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nolcore-ia
+spec:
+  replicas: 2
+  selector:
+    matchLabels: {app: nolcore-ia}
+  template:
+    metadata: {labels: {app: nolcore-ia}}
+    spec:
+      containers:
+        - name: ia
+          image: ghcr.io/noliae-france/nolcore-ia:main
+          ports: [{containerPort: 8092}]
+          envFrom:
+            - secretRef: {name: nolcore-ia-secrets}
+          readinessProbe: {httpGet: {path: /api/health, port: 8092}}
+          livenessProbe: {httpGet: {path: /api/health, port: 8092}}
+---
+apiVersion: v1
+kind: Service
+metadata: {name: nolcore-ia}
+spec:
+  selector: {app: nolcore-ia}
+  ports: [{port: 8092, targetPort: 8092}]

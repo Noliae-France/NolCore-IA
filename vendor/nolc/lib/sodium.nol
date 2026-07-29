@@ -1,0 +1,313 @@
+// SDK libsodium de Nolc, écrit en pur Nolc par-dessus libsodium (FFI).
+// Copyright Bastien LANGUEDOC.
+//
+// Crypto auditée : on ne réimplémente rien, on se contente d'envelopper
+// libsodium derrière une surface Option/Bool fidèle à la philosophie du
+// langage (aucune sentinelle brute ne fuit vers l'appelant).
+//
+// Compilation d'un programme qui importe ce module :
+//
+// nolc build prog.nol --lien sodium \
+// --chemin-lib "$(brew --prefix libsodium)/lib"    # macOS Homebrew
+// nolc build prog.nol --lien sodium                  # Linux (libsodium-dev)
+//
+// Aucun chemin d'include n'est requis : les liaisons extern ci-dessous ne
+// portent PAS de clause « depuis », le codegen émet donc ses propres
+// prototypes. libsodium n'étant déclaré par aucun include du runtime Nolc,
+// il n'y a aucun conflit de prototype. Le seul écart nominal avec les vraies
+// signatures est cosmétique : les tampons y sont des unsigned char* annotés
+// bytes_len lorsque la longueur suit immédiatement, et les longueurs des long
+// long (au lieu de unsigned long long / size_t). Sur les ABI visées, ces
+// conversions sont silencieuses et correctes ; les valeurs manipulées (<= 2^31)
+// ne débordent jamais un unsigned long long.
+
+// --- liaisons libsodium (privées au module) ---
+extern fn sodium_init() -> Int
+extern fn randombytes_buf(buf: bytes_len Bytes, size: Int)
+extern fn crypto_kx_keypair(pk: Bytes, sk: Bytes) -> Int
+extern fn crypto_kx_client_session_keys(rx: Bytes, tx: Bytes, client_pk: Bytes, client_sk: Bytes, server_pk: Bytes) -> Int
+extern fn crypto_kx_server_session_keys(rx: Bytes, tx: Bytes, server_pk: Bytes, server_sk: Bytes, client_pk: Bytes) -> Int
+extern fn crypto_secretbox_easy(c: Bytes, m: bytes_len Bytes, mlen: Int, n: Bytes, k: Bytes) -> Int
+extern fn crypto_secretbox_open_easy(m: Bytes, c: bytes_len Bytes, clen: Int, n: Bytes, k: Bytes) -> Int
+extern fn crypto_generichash(out: Bytes, outlen: Int, msg: bytes_len Bytes, msglen: Int, key: Bytes, keylen: Int) -> Int
+extern fn crypto_sign_verify_detached(sig: Bytes, msg: bytes_len Bytes, msglen: Int, pk: Bytes) -> Int
+extern fn crypto_pwhash_str(out: Bytes, mot_de_passe: bytes_len Bytes, taille: Int, opslimit: Int, memlimit: Int) -> Int
+extern fn crypto_pwhash_str_verify(hash: Text, mot_de_passe: bytes_len Bytes, taille: Int) -> Int
+extern fn crypto_pwhash_str_needs_rehash(hash: Text, opslimit: Int, memlimit: Int) -> Int
+extern fn sodium_memzero(buf: bytes_len Bytes, taille: Int)
+
+// ------------------- Tailles (constantes) -------------------
+// Exposées en fonctions : Nolc n'a pas de constante de niveau module.
+
+// crypto_kx : échange de clés X25519.
+fn kx_publickeybytes() -> Int {
+    return 32
+}
+
+fn kx_secretkeybytes() -> Int {
+    return 32
+}
+
+fn kx_sessionkeybytes() -> Int {
+    return 32
+}
+
+// crypto_secretbox : AEAD XSalsa20-Poly1305.
+fn secretbox_keybytes() -> Int {
+    return 32
+}
+
+fn secretbox_noncebytes() -> Int {
+    return 24
+}
+
+fn secretbox_macbytes() -> Int {
+    return 16
+}
+
+// crypto_sign : Ed25519.
+fn sign_publickeybytes() -> Int {
+    return 32
+}
+
+fn sign_bytes() -> Int {
+    return 64
+}
+
+// ------------------- Initialisation -------------------
+
+// Initialise libsodium. Idempotent : sodium_init() renvoie 0 (première fois)
+// ou 1 (déjà initialisé), les deux valent succès ; -1 signale un échec.
+// À appeler une fois avant tout autre usage.
+fn sodium_prete() -> Bool {
+    unsafe {
+        let rc = sodium_init()
+        return rc >= 0
+    }
+}
+
+// ------------------- Mots de passe (Argon2id) -------------------
+
+fn mot_de_passe_opslimit() -> Int {
+    return 2
+}
+
+fn mot_de_passe_memlimit() -> Int {
+    return 67108864
+}
+
+fn mot_de_passe_texte_depuis_tampon(tampon: Bytes) -> Option<Text> {
+    var fin = 0
+    while fin < len(tampon) and bytes_get(tampon, fin) != 0 {
+        fin += 1
+    }
+    if fin == 0 or fin == len(tampon) {
+        return none
+    }
+    return bytes_to_text(bytes_slice(tampon, 0, fin))
+}
+
+// Le mot de passe est un Bytes afin que l'appelant puisse appeler
+// `efface_secret` immédiatement après usage.
+fn mot_de_passe_hache(mot_de_passe: Bytes) -> Option<Text> {
+    if len(mot_de_passe) == 0 or len(mot_de_passe) > 1024 or not sodium_prete() {
+        return none
+    }
+    var sortie = bytes_zeros(128)
+    unsafe {
+        if crypto_pwhash_str(sortie, mot_de_passe, len(mot_de_passe), mot_de_passe_opslimit(), mot_de_passe_memlimit()) != 0 {
+            return none
+        }
+    }
+    return mot_de_passe_texte_depuis_tampon(sortie)
+}
+
+fn mot_de_passe_verifie(hash: Text, mot_de_passe: Bytes) -> Bool {
+    if not starts_with(hash, "$argon2id$") or len(hash) > 127 or len(mot_de_passe) > 1024 or not sodium_prete() {
+        return false
+    }
+    unsafe {
+        return crypto_pwhash_str_verify(hash, mot_de_passe, len(mot_de_passe)) == 0
+    }
+}
+
+fn mot_de_passe_rehash_requis(hash: Text) -> Bool {
+    if not starts_with(hash, "$argon2id$") or len(hash) > 127 or not sodium_prete() {
+        return true
+    }
+    unsafe {
+        return crypto_pwhash_str_needs_rehash(hash, mot_de_passe_opslimit(), mot_de_passe_memlimit()) != 0
+    }
+}
+
+// ------------------- Aléatoire -------------------
+
+// n octets aléatoires cryptographiquement sûrs (randombytes_buf).
+fn alea_bytes(n: Int) -> Bytes {
+    var tampon = bytes_zeros(n)
+    if n > 0 {
+        unsafe {
+            randombytes_buf(tampon, len(tampon))
+        }
+    }
+    return tampon
+}
+
+// Un nonce neuf de 24 octets, prêt pour secretbox. Un nonce aléatoire de
+// 24 octets ne se répète en pratique jamais pour une même clé.
+fn nonce_neuf() -> Bytes {
+    return alea_bytes(24)
+}
+
+// ------------------- Échange de clés X25519 (crypto_kx) -------------------
+//
+// Forme de retour choisie : PARAMÈTRES DE SORTIE + Bool. Les clés voyagent
+// dans des Bytes que l'appelant pré-alloue ; cela évite une recopie et colle
+// au plus près de l'API C. L'appelant alloue chaque tampon à la bonne taille
+// (kx_publickeybytes / kx_secretkeybytes / kx_sessionkeybytes) et lit le
+// résultat dedans après un retour true.
+
+// Génère une paire (pk, sk). pk et sk doivent faire 32 octets chacun.
+// true en cas de succès.
+fn kx_paire(pk: Bytes, sk: Bytes) -> Bool {
+    if len(pk) != 32 or len(sk) != 32 {
+        return false
+    }
+    unsafe {
+        return crypto_kx_keypair(pk, sk) == 0
+    }
+}
+
+// Dérive les clés de session côté client. rx (réception) et tx (émission)
+// sont écrits (32 octets chacun). false si la clé publique serveur est
+// suspecte (tous zéros) ou si une taille est incorrecte.
+fn kx_session_client(rx: Bytes, tx: Bytes, pk_client: Bytes, sk_client: Bytes, pk_serveur: Bytes) -> Bool {
+    if len(rx) != 32 or len(tx) != 32 {
+        return false
+    }
+    if len(pk_client) != 32 or len(sk_client) != 32 or len(pk_serveur) != 32 {
+        return false
+    }
+    unsafe {
+        return crypto_kx_client_session_keys(rx, tx, pk_client, sk_client, pk_serveur) == 0
+    }
+}
+
+// Dérive les clés de session côté serveur. Par construction de crypto_kx,
+// le tx du client égale le rx du serveur et inversement.
+fn kx_session_serveur(rx: Bytes, tx: Bytes, pk_serveur: Bytes, sk_serveur: Bytes, pk_client: Bytes) -> Bool {
+    if len(rx) != 32 or len(tx) != 32 {
+        return false
+    }
+    if len(pk_serveur) != 32 or len(sk_serveur) != 32 or len(pk_client) != 32 {
+        return false
+    }
+    unsafe {
+        return crypto_kx_server_session_keys(rx, tx, pk_serveur, sk_serveur, pk_client) == 0
+    }
+}
+
+// ------------------- Hachage générique (crypto_generichash / BLAKE2b) -------------------
+//
+// crypto_generichash est le BLAKE2b de libsodium. On l'expose comme un KDF /
+// combineur : sortie de 32 octets, sans clé (mode non-clé). Il sert à combiner
+// DEUX secrets partagés (un éphémère, un statique) en une clé de session unique
+// pour le canal (voir lib/canal_securise.nol, forward secrecy).
+//
+// Propriété exploitée : BLAKE2b est un PRF sûr, donc H(prefixe || a || b) est
+// indistinguable de l'aléatoire dès lors qu'AU MOINS UN des secrets d'entrée est
+// inconnu de l'attaquant. C'est exactement le combineur employé par les schémas
+// d'échange hybrides (la sécurité tient si l'un des deux échanges tient).
+
+// Hache `message` en 32 octets (BLAKE2b, sans clé). none si libsodium refuse.
+fn generichash32(message: Bytes) -> Option<Bytes> {
+    var sortie = bytes_zeros(32)
+    var sans_cle = bytes_new()
+    unsafe {
+        let rc = crypto_generichash(sortie, 32, message, len(message), sans_cle, 0)
+        if rc != 0 {
+            return none
+        }
+    }
+    return some(sortie)
+}
+
+// Vérifie une signature Ed25519 détachée. Renvoie false si une taille est
+// incorrecte ou si libsodium refuse la signature.
+fn sign_verifie(signature: Bytes, message: Bytes, cle_publique: Bytes) -> Bool {
+    if len(signature) != 64 or len(cle_publique) != 32 {
+        return false
+    }
+    unsafe {
+        return crypto_sign_verify_detached(signature, message, len(message), cle_publique) == 0
+    }
+}
+
+// Combineur de clés pour la forward secrecy du canal. Dérive une clé de session
+// de 32 octets à partir d'une clé de session ÉPHÉMÈRE et d'une clé de session
+// STATIQUE (toutes deux issues de crypto_kx), liées par une étiquette de
+// direction pour la séparation de domaine. La clé résultante est secrète tant
+// que l'un des deux secrets l'est : la partie éphémère apporte la FS, la partie
+// statique l'authentification. none si le hachage échoue ou si une taille est
+// incorrecte.
+fn kx_combine(etiquette: Bytes, cle_eph: Bytes, cle_stat: Bytes) -> Option<Bytes> {
+    if len(cle_eph) != 32 or len(cle_stat) != 32 {
+        return none
+    }
+    var entree = bytes_new()
+    bytes_append(entree, etiquette)
+    bytes_append(entree, cle_eph)
+    bytes_append(entree, cle_stat)
+    return generichash32(entree)
+}
+
+// Efface un tampon secret en mémoire (sodium_memzero, non éliminé par
+// l'optimiseur). À appeler sur les secrets éphémères après dérivation pour que
+// la forward secrecy soit réelle (le secret ne survit pas en mémoire).
+fn efface_secret(b: Bytes) {
+    if len(b) > 0 {
+        unsafe {
+            sodium_memzero(b, len(b))
+        }
+    }
+}
+
+// ------------------- AEAD (crypto_secretbox) -------------------
+
+// Chiffre et authentifie un message. Sortie = MACBYTES (16) + message.
+// none si le nonce (24) ou la clé (32) n'ont pas la bonne taille, ou si
+// libsodium refuse.
+fn secretbox_chiffre(message: Bytes, nonce: Bytes, cle: Bytes) -> Option<Bytes> {
+    if len(nonce) != 24 or len(cle) != 32 {
+        return none
+    }
+    var chiffre = bytes_zeros(16 + len(message))
+    unsafe {
+        let rc = crypto_secretbox_easy(chiffre, message, len(message), nonce, cle)
+        if rc != 0 {
+            return none
+        }
+    }
+    return some(chiffre)
+}
+
+// Vérifie l'authenticité puis déchiffre. none si le MAC est invalide (message
+// ou nonce altéré, mauvaise clé), si le chiffré est trop court, ou si le nonce
+// ou la clé n'ont pas la bonne taille. C'est le point critique : un MAC
+// invalide DOIT donner none, jamais un clair douteux.
+fn secretbox_dechiffre(chiffre: Bytes, nonce: Bytes, cle: Bytes) -> Option<Bytes> {
+    if len(nonce) != 24 or len(cle) != 32 {
+        return none
+    }
+    if len(chiffre) < 16 {
+        return none
+    }
+    var clair = bytes_zeros(len(chiffre) - 16)
+    unsafe {
+        let rc = crypto_secretbox_open_easy(clair, chiffre, len(chiffre), nonce, cle)
+        if rc != 0 {
+            return none
+        }
+    }
+    return some(clair)
+}

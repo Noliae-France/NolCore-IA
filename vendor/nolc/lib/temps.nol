@@ -1,0 +1,178 @@
+// Bibliothèque temps et date pour Nolc, en pur Nolc au-dessus de l'epoch UNIX.
+//
+// import "lib/temps.nol"
+//
+// Tous les calculs calendaires sont déterministes : ils ne reposent que sur
+// de l'arithmétique entière sur l'Int epoch (secondes UTC depuis 1970), donc
+// portables et testables. L'algorithme de conversion jour <-> date civile est
+// celui de Howard Hinnant (« chrono-Compatible Low-Level Date Algorithms »),
+// qui gère correctement les années bissextiles (y compris séculaires).
+//
+// Seule maintenant_epoch() franchit la frontière C (FFI) pour lire l'horloge
+// murale : voir la note sur la liaison plus bas. Le reste est pur Nolc.
+//
+// Copyright : Bastien LANGUEDOC.
+
+// ---- Horloge murale (FFI) ----
+//
+// On lie la fonction C standard « time » via « depuis "time.h" » : le prototype
+// vient de l'en-tête, le codegen n'en émet donc aucun et il n'y a plus de
+// conflit de signature (l'ancien contournement par « ftime » et un tampon
+// Bytes n'est plus nécessaire). L'argument (pointeur de sortie) est nul : on ne
+// veut que la valeur de retour, l'epoch en secondes UTC. Aucune option --lien.
+extern fn time(tloc: Ptr) -> Int depuis "time.h"
+
+// Secondes UTC écoulées depuis le 1er janvier 1970 (epoch UNIX).
+fn maintenant_epoch() -> Int {
+    unsafe {
+        return time(ptr_null())
+    }
+}
+
+// ---- Date civile UTC ----
+
+// Composantes d'un instant UTC. Tous scalaires Int : record autorisé.
+record Date {
+    annee: Int,  // ex. 2026
+    mois: Int,  // 1 à 12
+    jour: Int,  // 1 à 31
+    heure: Int,  // 0 à 23
+    minute: Int,  // 0 à 59
+    seconde: Int  // 0 à 59
+}
+
+// Division plancher : arrondit vers moins l'infini (contrairement à « / » qui
+// tronque vers zéro). Indispensable pour un epoch négatif (avant 1970) ; sans
+// effet pour un epoch positif. Robustesse gratuite.
+fn div_plancher(a: Int, b: Int) -> Int {
+    var q = a / b
+    let r = a % b
+    if r != 0 and (r < 0) != (b < 0) {
+        q = q - 1
+    }
+    return q
+}
+
+// Convertit un epoch (secondes UTC) en Date UTC.
+// Algorithme civil-from-days de H. Hinnant : ère de 400 ans, jour dans l'ère
+// (doe), année dans l'ère (yoe), jour de l'année (doy), puis mois et jour.
+fn epoch_vers_date(epoch: Int) -> Date {
+    let jours = div_plancher(epoch, 86400)
+    let sod = epoch - jours * 86400  // secondes du jour, 0..86399
+
+    let heure = sod / 3600
+    let minute = (sod / 60) % 60
+    let seconde = sod % 60
+
+    // Décale l'origine au 1er mars 0000 (année-mois « shifté ») : z en jours.
+    let z = jours + 719468
+    let era = div_plancher(z, 146097)  // ère de 146097 jours (400 ans)
+    let doe = z - era * 146097  // 0..146096
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365  // 0..399
+    let y = yoe + era * 400
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100)  // 0..365 (origine mars)
+    let mp = (5 * doy + 2) / 153  // mois « shifté » 0..11 (0 = mars)
+    let jour = doy - (153 * mp + 2) / 5 + 1  // 1..31
+
+    var mois = mp + 3
+    if mp >= 10 {
+        mois = mp - 9
+    }
+    var annee = y
+    if mois <= 2 {
+        annee = y + 1
+    }
+
+    return Date { annee: annee, mois: mois, jour: jour,
+        heure: heure, minute: minute, seconde: seconde }
+}
+
+// Convertit une Date UTC en epoch (secondes UTC). Inverse exact de
+// epoch_vers_date : algorithme days-from-civil de H. Hinnant.
+fn date_vers_epoch(d: Date) -> Int {
+    var y = d.annee
+    if d.mois <= 2 {
+        y = y - 1
+    }
+    let era = div_plancher(y, 400)
+    let yoe = y - era * 400  // 0..399
+
+    var mm = d.mois + 9  // mois shifté : mars = 0
+    if d.mois > 2 {
+        mm = d.mois - 3
+    }
+    let doy = (153 * mm + 2) / 5 + d.jour - 1  // 0..365
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy  // 0..146096
+    let jours = era * 146097 + doe - 719468
+
+    return jours * 86400 + d.heure * 3600 + d.minute * 60 + d.seconde
+}
+
+// ---- Formatage ----
+
+// Complète un entier positif de zéros de tête jusqu'à « largeur » chiffres.
+fn zero_tete(n: Int, largeur: Int) -> Text {
+    var s = text(n)
+    while len(s) < largeur {
+        s = "0" + s
+    }
+    return s
+}
+
+// Formate une Date en ISO 8601 UTC : "YYYY-MM-DDThh:mm:ssZ".
+fn format_iso8601(d: Date) -> Text {
+    return zero_tete(d.annee, 4) + "-" + zero_tete(d.mois, 2) + "-"
+        + zero_tete(d.jour, 2) + "T" + zero_tete(d.heure, 2) + ":"
+        + zero_tete(d.minute, 2) + ":" + zero_tete(d.seconde, 2) + "Z"
+}
+
+// ---- Jour de la semaine ----
+
+// Jour de la semaine d'un epoch : 0 = dimanche, 1 = lundi, ... 6 = samedi.
+// Formule de Hinnant : le jour 0 (1970-01-01) est un jeudi (4).
+fn jour_semaine(epoch: Int) -> Int {
+    let jours = div_plancher(epoch, 86400)
+    var w = (jours + 4) % 7
+    if w < 0 {
+        w = w + 7
+    }
+    return w
+}
+
+// Nom français du jour de la semaine (0 = dimanche .. 6 = samedi).
+fn nom_jour(indice: Int) -> Text {
+    let noms = ["dimanche", "lundi", "mardi", "mercredi",
+        "jeudi", "vendredi", "samedi"]
+    if indice < 0 or indice > 6 {
+        return "?"
+    }
+    return get(noms, indice)
+}
+
+// Nom français du mois (1 = janvier .. 12 = décembre).
+fn nom_mois(mois: Int) -> Text {
+    let noms = ["janvier", "février", "mars", "avril", "mai", "juin",
+        "juillet", "août", "septembre", "octobre", "novembre", "décembre"]
+    if mois < 1 or mois > 12 {
+        return "?"
+    }
+    return get(noms, mois - 1)
+}
+
+// ---- Helpers de durée ----
+
+fn ajouter_secondes(epoch: Int, n: Int) -> Int {
+    return epoch + n
+}
+
+fn ajouter_minutes(epoch: Int, n: Int) -> Int {
+    return epoch + n * 60
+}
+
+fn ajouter_heures(epoch: Int, n: Int) -> Int {
+    return epoch + n * 3600
+}
+
+fn ajouter_jours(epoch: Int, n: Int) -> Int {
+    return epoch + n * 86400
+}

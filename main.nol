@@ -1,0 +1,31 @@
+import "../nolc/lib/web.nol"
+import "../nolc/lib/json.nol"
+import "../nolc/lib/http_client.nol"
+
+fn ia_erreur(code: Int, message: Text, req: Requete) -> WebResultat { return WebResultat.WebEchec(erreur_http(code,"IA",message,requete_id(req))) }
+fn ia_health(_r: Requete, _p: Map<Text>) -> WebResultat { return WebResultat.WebOk(reponse_json("{\"status\":\"ok\",\"service\":\"ia\",\"runtime\":\"nolc\"}")) }
+fn parametre(p: Map<Text>, k: Text) -> Text { return unwrap_or(map_get(p,k),"") }
+fn ia_run(req: Requete, p: Map<Text>) -> WebResultat {
+    let provider=parametre(p,"nameid"); let model=parametre(p,"modelia"); let text_input=parametre(p,"text")
+    if provider=="" or model=="" or text_input=="" { return ia_erreur(422,"provider, model et text obligatoires",req) }
+    let prefix="NOLCORE_"+upper(provider); let token=unwrap_or(env(prefix+"_TOKEN"),""); var url=unwrap_or(env(prefix+"_URL"),"")
+    if url=="" and (provider=="chatgpt" or provider=="openai") { url="https://api.openai.com/v1/chat/completions" }
+    if url=="" and provider=="claude" { url="https://api.anthropic.com/v1/messages" }
+    if url=="" and provider=="mistral" { url="https://api.mistral.ai/v1/chat/completions" }
+    if url=="" and provider=="gemini" { url="https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent?key="+token }
+    if token=="" { return ia_erreur(503,"Token fournisseur absent",req) }
+    let rep=http_post_token(url,"application/json","{\"model\":"+json_texte(model)+",\"messages\":[{\"role\":\"user\",\"content\":"+json_texte(text_input)+"}]}",token)
+    if not has(rep) or unwrap_or(rep,ReponseHttp {statut:0,entetes:"",corps:""}).statut>=300 { return ia_erreur(502,"Fournisseur IA indisponible",req) }
+    return WebResultat.WebOk(reponse_json("{\"provider\":"+json_texte(provider)+",\"model\":"+json_texte(model)+",\"result\":"+json_texte(unwrap_or(rep,ReponseHttp {statut:200,entetes:"",corps:""}).corps)+"}"))
+}
+fn ia_run_body(req: Requete, _p: Map<Text>) -> WebResultat {
+    let body = requete_json(req)
+    if not has(body) { return ia_erreur(400,"JSON invalide",req) }
+    var p: Map<Text> = map_new()
+    map_set(p,"nameid",unwrap_or(json_texte_champ(unwrap_or(body,""),"provider"),""))
+    map_set(p,"modelia",unwrap_or(json_texte_champ(unwrap_or(body,""),"model"),""))
+    map_set(p,"text",unwrap_or(json_texte_champ(unwrap_or(body,""),"text"),""))
+    return ia_run(req,p)
+}
+fn application(req: Requete) -> WebResultat { var m: List<Text> = []; var p: List<Text> = []; var h: List<Fn(Requete, Map<Text>) -> WebResultat> = []; route_type(m,p,h,"GET","/api/health",ia_health); route_type(m,p,h,"POST","/v1/ia",ia_run_body); route_type(m,p,h,"POST","/v1/ia/:nameid/:modelia/:text",ia_run); return routeur_dispatch_type(m,p,h,req) }
+fn main() { let port=unwrap_or(parse_int(unwrap_or(env("NOLIAE_PORT"),"8092")),8092); let l=tcp_listen(port); if not has(l){return}; let s=unwrap_or(l,-1); var middlewares: List<Fn(Requete,Reponse) -> Reponse> = []; while true { let a=tcp_accept(s); if has(a){let f=unwrap_or(a,-1); let raw=unwrap_or(tcp_read(f),""); let rep=web_repondre_resultat(raw,web_limites_defaut(),application,middlewares); let _w=tcp_write(f,rep); tcp_close(f)}} }

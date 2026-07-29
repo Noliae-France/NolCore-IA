@@ -1,0 +1,149 @@
+// SDK PostgreSQL de Nolc, écrit en pur Nolc par-dessus libpq (FFI).
+//
+// Compilation :  nolc build mon_prog.nol --lien pq --chemin-lib $(pg_config --libdir)
+//
+// Modèle : un handle de connexion (Ptr<PgConn>) et un handle de résultat
+// (Ptr<PgResult>). Les appels libpq bruts restent confinés dans ce module,
+// derrière des fonctions Nolc qui renvoient Option/Bool au lieu de sentinelles.
+
+// --- liaisons libpq (privées au module) ---
+opaque PgConn
+opaque PgResult
+
+extern fn PQconnectdb(conninfo: Text) -> Ptr<PgConn>
+extern fn PQstatus(conn: Ptr<PgConn>) -> Int
+extern fn PQerrorMessage(conn: Ptr<PgConn>) -> Text
+extern fn PQfinish(conn: Ptr<PgConn>)
+extern fn PQexec(conn: Ptr<PgConn>, requete: Text) -> Ptr<PgResult>
+// Requête paramétrée. Signature C :
+// PGresult *PQexecParams(PGconn *conn, const char *command, int nParams,
+// const Oid *paramTypes, const char *const *paramValues,
+// const int *paramLengths, const int *paramFormats, int resultFormat)
+// paramTypes / paramLengths / paramFormats restent NULL (tout en texte),
+// resultFormat = 0 (résultat texte). paramValues est le tableau C de
+// pointeurs (char**), transporté comme un Bytes dont le buffer contient les
+// pointeurs (voir pg_requete_params).
+extern fn PQexecParams(conn: Ptr<PgConn>, commande: Text, nParams: Int, paramTypes: Ptr, paramValues: Bytes, paramLengths: Ptr, paramFormats: Ptr, resultFormat: Int) -> Ptr<PgResult>
+extern fn PQresultStatus(res: Ptr<PgResult>) -> Int
+extern fn PQntuples(res: Ptr<PgResult>) -> Int
+extern fn PQnfields(res: Ptr<PgResult>) -> Int
+extern fn PQgetvalue(res: Ptr<PgResult>, ligne: Int, colonne: Int) -> Text
+extern fn PQgetisnull(res: Ptr<PgResult>, ligne: Int, colonne: Int) -> Int
+extern fn PQclear(res: Ptr<PgResult>)
+
+// CONNECTION_OK = 0 ; PGRES_TUPLES_OK = 2 ; PGRES_COMMAND_OK = 1
+
+// Ouvre une connexion. none si le serveur refuse.
+fn pg_ouvrir(conninfo: Text) -> Option<Ptr<PgConn>> {
+    unsafe {
+        let conn = PQconnectdb(conninfo)
+        if ptr_est_nul(conn) {
+            return none
+        }
+        if PQstatus(conn) == 0 {
+            return some(conn)
+        }
+        PQfinish(conn)
+        return none
+    }
+}
+
+fn pg_erreur(conn: Ptr<PgConn>) -> Text {
+    unsafe {
+        return PQerrorMessage(conn)
+    }
+}
+
+fn pg_fermer(conn: Ptr<PgConn>) {
+    unsafe {
+        PQfinish(conn)
+    }
+}
+
+// Exécute une requête et renvoie le handle de résultat, ou none sur erreur.
+// L'appelant doit appeler pg_liberer(res).
+fn pg_requete(conn: Ptr<PgConn>, sql: Text) -> Option<Ptr<PgResult>> {
+    unsafe {
+        let res = PQexec(conn, sql)
+        if ptr_est_nul(res) {
+            return none
+        }
+        let st = PQresultStatus(res)
+        // 1 = COMMAND_OK (INSERT/UPDATE...), 2 = TUPLES_OK (SELECT)
+        if st == 1 or st == 2 {
+            return some(res)
+        }
+        PQclear(res)
+        return none
+    }
+}
+
+// Exécute une requête PARAMÉTRÉE et renvoie le handle de résultat, ou none sur
+// erreur. Les valeurs sont liées SÉPARÉMENT via PQexecParams : le SQL ne porte
+// que des placeholders `$1, $2, ...` et n'est JAMAIS concaténé avec les données.
+// Une valeur comme `'; DROP TABLE x; --` est donc traitée comme une donnée, pas
+// comme du SQL. C'est la voie sûre à préférer à pg_requete dès qu'une entrée
+// vient de l'extérieur. L'appelant doit appeler pg_liberer(res).
+//
+// Détail FFI : PQexecParams attend un `const char *const *` (tableau de
+// pointeurs vers des chaînes C null-terminées). On le construit en pur Nolc :
+// - chaque paramètre est copié dans un Bytes suivi d'un octet nul (chaîne C) ;
+// - `valeurs` est un Bytes de n * ptr_size() octets ; bytes_set_ptr y écrit
+// l'adresse du buffer de chaque paramètre (un slot de pointeur par valeur) ;
+// - passé en paramètre extern, `valeurs` traverse comme le buffer sous-jacent,
+// soit exactement le `char**` attendu par libpq.
+// Les tampons restent vivants (liste `gardiens`) pour toute la durée de l'appel.
+fn pg_requete_params(conn: Ptr<PgConn>, sql: Text, params: List<Text>) -> Option<Ptr<PgResult>> {
+    let n = len(params)
+    var gardiens: List<Bytes> = []
+    var valeurs = bytes_zeros(n * ptr_size())
+    var i = 0
+    while i < n {
+        var tampon = bytes_from_text(get(params, i))
+        bytes_push(tampon, 0)  // terminateur nul : chaîne C
+        push(gardiens, tampon)  // garde le buffer en vie
+        bytes_set_ptr(valeurs, i * ptr_size(), tampon)  // adresse -> tableau char**
+        i = i + 1
+    }
+    unsafe {
+        let res = PQexecParams(conn, sql, n, ptr_null(), valeurs, ptr_null(), ptr_null(), 0)
+        if ptr_est_nul(res) {
+            return none
+        }
+        let st = PQresultStatus(res)
+        // 1 = COMMAND_OK (INSERT/UPDATE...), 2 = TUPLES_OK (SELECT)
+        if st == 1 or st == 2 {
+            return some(res)
+        }
+        PQclear(res)
+        return none
+    }
+}
+
+fn pg_lignes(res: Ptr<PgResult>) -> Int {
+    unsafe {
+        return PQntuples(res)
+    }
+}
+
+fn pg_colonnes(res: Ptr<PgResult>) -> Int {
+    unsafe {
+        return PQnfields(res)
+    }
+}
+
+// Valeur d'une cellule. none si NULL SQL (distinct d'une chaîne vide).
+fn pg_valeur(res: Ptr<PgResult>, ligne: Int, colonne: Int) -> Option<Text> {
+    unsafe {
+        if PQgetisnull(res, ligne, colonne) == 1 {
+            return none
+        }
+        return some(PQgetvalue(res, ligne, colonne))
+    }
+}
+
+fn pg_liberer(res: Ptr<PgResult>) {
+    unsafe {
+        PQclear(res)
+    }
+}

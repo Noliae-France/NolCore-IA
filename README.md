@@ -10,3 +10,7 @@ Les tokens API sont exclusivement injectés par l’environnement, un Secret Kub
 - GET /v1/search/ia/:keyword
 
 Le service est conçu pour être déployé indépendamment du gateway API.
+
+Le binaire écoute sur le port `8092`. Il ne contient ni PostgreSQL ni gestion
+des utilisateurs : les tokens fournisseurs sont propres à ce service et le
+réseau Kubernetes doit le garder interne.
