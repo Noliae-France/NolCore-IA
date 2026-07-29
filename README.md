@@ -15,7 +15,8 @@
 
 NolCore-IA centralise les appels aux fournisseurs IA sans exposer leurs tokens
 au navigateur, au gateway ou à PostgreSQL. Il reçoit une requête normalisée,
-choisit le fournisseur et renvoie la réponse brute dans une enveloppe JSON.
+appelle le fournisseur demandé et renvoie une enveloppe contenant la réponse
+fournisseur, les compteurs de tokens disponibles et un coût estimé.
 
 Fournisseurs supportés : **Claude**, **ChatGPT/OpenAI**, **Mistral** et
 **Gemini**.
@@ -37,6 +38,7 @@ Le service écoute par défaut sur le port `8092`.
 | Méthode | Route | Corps / description |
 |---|---|---|
 | `GET` | `/api/health` | Liveness et readiness probe |
+| `GET` | `/v1/ia/models` | Catalogue live des modèles OpenAI, Mistral et Gemini configurés |
 | `POST` | `/v1/ia` | `{"provider":"mistral","model":"...","text":"..."}` |
 | `POST` | `/v1/ia/:nameid/:modelia/:text` | Variante avec paramètres de route |
 
@@ -46,12 +48,16 @@ Réponse type :
 {
   "provider": "mistral",
   "model": "…",
+  "input_tokens": 120,
+  "output_tokens": 64,
+  "estimated_cost_micros": 0,
   "result": "réponse brute du fournisseur"
 }
 ```
 
 Les requêtes invalides retournent `400` ou `422`, un token absent `503` et une
-erreur fournisseur `502`.
+erreur fournisseur `502`. Le catalogue live est volontairement best-effort :
+un fournisseur indisponible est absent de la liste, sans révéler son token.
 
 ## Configuration fournisseurs
 
@@ -64,6 +70,23 @@ officielle est sélectionnée par défaut pour les fournisseurs connus.
 | ChatGPT/OpenAI | `NOLCORE_CHATGPT_TOKEN` | `NOLCORE_CHATGPT_URL` |
 | Mistral | `NOLCORE_MISTRAL_TOKEN` | `NOLCORE_MISTRAL_URL` |
 | Gemini | `NOLCORE_GEMINI_TOKEN` | `NOLCORE_GEMINI_URL` |
+
+Pour le catalogue live, les URL de catalogue peuvent être surchargées avec
+`NOLCORE_CHATGPT_MODELS_URL`, `NOLCORE_MISTRAL_MODELS_URL` et
+`NOLCORE_GEMINI_MODELS_URL`. Claude n’expose pas de catalogue général
+équivalent dans ce service ; ses modèles sont configurés explicitement côté
+Core.
+
+Le coût est un calcul local, basé sur les tokens retournés par le fournisseur :
+
+| Variable | Rôle |
+|---|---|
+| `NOLCORE_<PROVIDER>_INPUT_MICROS_PER_1K` | Prix d’entrée en micro-unités pour 1 000 tokens |
+| `NOLCORE_<PROVIDER>_OUTPUT_MICROS_PER_1K` | Prix de sortie en micro-unités pour 1 000 tokens |
+
+Par exemple, utilisez `NOLCORE_MISTRAL_INPUT_MICROS_PER_1K` et
+`NOLCORE_MISTRAL_OUTPUT_MICROS_PER_1K`. À `0`, le coût reste inconnu : aucun
+prix fictif n’est affiché.
 
 `NOLIAE_PORT` permet de modifier le port d’écoute (`8092` par défaut).
 
@@ -102,7 +125,7 @@ kubectl -n nolcore rollout status deployment/nolcore-ia
 Conservez le Service sans Ingress public. NolCore-API doit l’appeler via
 `http://nolcore-ia:8092` dans le cluster.
 
-## Développement et CI/CD
+## Build, imports Nolc et CI/CD
 
 ```sh
 nolc check main.nol
@@ -110,9 +133,18 @@ nolc build main.nol -o nolcore --lien ssl --lien crypto
 ```
 
 Le Dockerfile télécharge le compilateur Nolc public, produit un binaire dans une
-étape de build et démarre le runtime sous un utilisateur non-root. La CI valide
-la compilation, le conteneur et publie l’image GHCR. La vérification de la
-chaîne API + IA + Crawler est exécutée dans
+étape de build et démarre le runtime sous un utilisateur non-root. Les imports
+Nolc historiques `../nolc/lib/*` et versionnés `vendor/nolc/lib/*` sont tous
+deux disponibles dans l’étape de compilation ; ne les remplacez pas par
+`COPY *.nol` seul.
+
+Deux workflows GitHub Actions sont exécutés sur `main` :
+
+- **IA CI** construit l’image sans publication ;
+- **Publish IA container** publie l’image validée
+  `ghcr.io/noliae-france/nolcore-ia:main`.
+
+La vérification de la chaîne API + IA + Crawler est exécutée dans
 [NolCore](https://github.com/Noliae-France/NolCore).
 
 ## Sécurité
@@ -120,6 +152,8 @@ chaîne API + IA + Crawler est exécutée dans
 - Le service est réservé au réseau interne.
 - Les tokens fournisseurs sont seulement lus depuis l’environnement.
 - Les données utilisateur et les contrôles d’accès restent dans NolCore-API.
+- Aucun token, corps de requête ou coût ne doit être considéré comme un secret
+  à journaliser : configurez vos logs pour ne pas conserver les prompts.
 - Configurez délais, limites de sortie réseau et journalisation selon vos
   contraintes de production.
 
