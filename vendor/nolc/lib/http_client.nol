@@ -621,6 +621,12 @@ fn http_get(url: Text) -> Option<ReponseHttp> {
     return hc_requete_suivie("GET", unwrap_or(u, UrlParties { schema: "http", hote: "", port: 80, chemin: "/" }), "", "", hc_redirections_max(), hc_timeout_defaut_ms(), hc_taille_max_defaut(), "")
 }
 
+fn http_get_token(url: Text, token: Text) -> Option<ReponseHttp> {
+    let u = url_parse(url)
+    if not has(u) { return none }
+    return hc_requete_suivie("GET", unwrap_or(u, UrlParties { schema: "http", hote: "", port: 80, chemin: "/" }), "", "", hc_redirections_max(), hc_timeout_defaut_ms(), hc_taille_max_defaut(), token)
+}
+
 // POST avec corps et type de contenu, suivi de redirection.
 fn http_post(url: Text, type_contenu: Text, corps: Text) -> Option<ReponseHttp> {
     let u = url_parse(url)

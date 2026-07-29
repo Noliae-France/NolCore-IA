@@ -1,10 +1,43 @@
 import "../nolc/lib/web.nol"
 import "../nolc/lib/json.nol"
-import "../nolc/lib/http_client.nol"
+import "vendor/nolc/lib/http_client.nol"
 
 fn ia_erreur(code: Int, message: Text, req: Requete) -> WebResultat { return WebResultat.WebEchec(erreur_http(code,"IA",message,requete_id(req))) }
 fn ia_health(_r: Requete, _p: Map<Text>) -> WebResultat { return WebResultat.WebOk(reponse_json("{\"status\":\"ok\",\"service\":\"ia\",\"runtime\":\"nolc\"}")) }
 fn parametre(p: Map<Text>, k: Text) -> Text { return unwrap_or(map_get(p,k),"") }
+fn ia_modeles_provider(provider: Text) -> Text {
+    let prefix = "NOLCORE_" + upper(provider)
+    let token = unwrap_or(env(prefix + "_TOKEN"),"")
+    if token == "" { return "[]" }
+    var url = unwrap_or(env(prefix + "_MODELS_URL"),"")
+    if url == "" and (provider == "chatgpt" or provider == "openai") { url = "https://api.openai.com/v1/models" }
+    if url == "" and provider == "mistral" { url = "https://api.mistral.ai/v1/models" }
+    if url == "" and provider == "gemini" { url = "https://generativelanguage.googleapis.com/v1beta/models?key=" + token }
+    if url == "" { return "[]" }
+    var auth = token
+    if provider == "gemini" { auth = "" }
+    let rep = http_get_token(url,auth)
+    if not has(rep) or unwrap_or(rep,ReponseHttp {statut:0,entetes:"",corps:""}).statut >= 300 { return "[]" }
+    let raw = unwrap_or(rep,ReponseHttp {statut:0,entetes:"",corps:""}).corps
+    var key = "data"
+    if provider == "gemini" { key = "models" }
+    var out = "["; var sep = ""; var i = 0
+    while i < 100 {
+        var name = json_chemin_texte(raw,key + "." + text(i) + ".id")
+        if provider == "gemini" { name = json_chemin_texte(raw,key + "." + text(i) + ".name") }
+        if not has(name) or unwrap_or(name,"") == "" { break }
+        out += sep + "{\"provider\":" + json_texte(provider) + ",\"model\":" + json_texte(unwrap_or(name,"")) + "}"; sep = ","; i = i + 1
+    }
+    return out + "]"
+}
+fn ia_modeles(_req: Requete, _p: Map<Text>) -> WebResultat {
+    var items = "["; var sep = ""
+    for provider in ["chatgpt","mistral","gemini"] {
+        let part = ia_modeles_provider(provider)
+        if part != "[]" { items += sep + sub(part,1,len(part)-1); sep = "," }
+    }
+    return WebResultat.WebOk(reponse_json(items + "]"))
+}
 fn ia_cout(provider: Text, entree: Int, sortie: Int) -> Int {
     let prefix = "NOLCORE_" + upper(provider)
     let in_rate = unwrap_or(parse_int(unwrap_or(env(prefix + "_INPUT_MICROS_PER_1K"),"0")),0)
@@ -43,5 +76,5 @@ fn ia_run_body(req: Requete, _p: Map<Text>) -> WebResultat {
     map_set(p,"text",unwrap_or(json_texte_champ(unwrap_or(body,""),"text"),""))
     return ia_run(req,p)
 }
-fn application(req: Requete) -> WebResultat { var m: List<Text> = []; var p: List<Text> = []; var h: List<Fn(Requete, Map<Text>) -> WebResultat> = []; route_type(m,p,h,"GET","/api/health",ia_health); route_type(m,p,h,"POST","/v1/ia",ia_run_body); route_type(m,p,h,"POST","/v1/ia/:nameid/:modelia/:text",ia_run); return routeur_dispatch_type(m,p,h,req) }
+fn application(req: Requete) -> WebResultat { var m: List<Text> = []; var p: List<Text> = []; var h: List<Fn(Requete, Map<Text>) -> WebResultat> = []; route_type(m,p,h,"GET","/api/health",ia_health); route_type(m,p,h,"GET","/v1/ia/models",ia_modeles); route_type(m,p,h,"POST","/v1/ia",ia_run_body); route_type(m,p,h,"POST","/v1/ia/:nameid/:modelia/:text",ia_run); return routeur_dispatch_type(m,p,h,req) }
 fn main() { let port=unwrap_or(parse_int(unwrap_or(env("NOLIAE_PORT"),"8092")),8092); let l=tcp_listen(port); if not has(l){return}; let s=unwrap_or(l,-1); var middlewares: List<Fn(Requete,Reponse) -> Reponse> = []; while true { let a=tcp_accept(s); if has(a){let f=unwrap_or(a,-1); let raw=unwrap_or(tcp_read(f),""); let rep=web_repondre_resultat(raw,web_limites_defaut(),application,middlewares); let _w=tcp_write(f,rep); tcp_close(f)}} }
