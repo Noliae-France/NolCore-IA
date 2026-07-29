@@ -20,7 +20,11 @@ fn ia_run(req: Requete, p: Map<Text>) -> WebResultat {
     if url=="" and provider=="mistral" { url="https://api.mistral.ai/v1/chat/completions" }
     if url=="" and provider=="gemini" { url="https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent?key="+token }
     if token=="" { return ia_erreur(503,"Token fournisseur absent",req) }
-    let rep=http_post_token(url,"application/json","{\"model\":"+json_texte(model)+",\"messages\":[{\"role\":\"user\",\"content\":"+json_texte(text_input)+"}]}",token)
+    var body = "{\"model\":"+json_texte(model)+",\"messages\":[{\"role\":\"user\",\"content\":"+json_texte(text_input)+"}]}"
+    var auth = token
+    if provider == "claude" { body = "{\"model\":"+json_texte(model)+",\"max_tokens\":1024,\"messages\":[{\"role\":\"user\",\"content\":"+json_texte(text_input)+"}]}"; auth = "X-Api-Key " + token }
+    if provider == "gemini" { body = "{\"contents\":[{\"parts\":[{\"text\":"+json_texte(text_input)+"}]}]}"; auth = "" }
+    let rep=http_post_token(url,"application/json",body,auth)
     if not has(rep) or unwrap_or(rep,ReponseHttp {statut:0,entetes:"",corps:""}).statut>=300 { return ia_erreur(502,"Fournisseur IA indisponible",req) }
     let raw = unwrap_or(rep,ReponseHttp {statut:200,entetes:"",corps:""}).corps
     var entree = unwrap_or(json_chemin_int(raw,"usage.prompt_tokens"),0)

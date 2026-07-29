@@ -235,7 +235,17 @@ fn hc_construire_requete(methode: Text, u: UrlParties, type_contenu: Text, corps
     r += "Host: " + hote_ligne + "\r\n"
     r += "User-Agent: nolc-http-client/1.0\r\n"
     r += "Accept: */*\r\n"
-    if auth != "" { r += "Authorization: Bearer " + auth + "\r\n" }
+    // Les adaptateurs fournisseurs utilisent soit Bearer, soit la clé API
+    // Anthropic. Les valeurs sont refusées si elles tentent une injection CRLF.
+    if starts_with(auth, "X-Api-Key ") {
+        let key = sub(auth, 10, len(auth))
+        if hc_a_crlf(key) or key == "" { return none }
+        r += "x-api-key: " + key + "\r\n"
+        r += "anthropic-version: 2023-06-01\r\n"
+    } else if auth != "" {
+        if hc_a_crlf(auth) { return none }
+        r += "Authorization: Bearer " + auth + "\r\n"
+    }
     r += "Connection: close\r\n"
     if corps != "" {
         if type_contenu != "" {
