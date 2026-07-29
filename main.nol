@@ -5,6 +5,12 @@ import "../nolc/lib/http_client.nol"
 fn ia_erreur(code: Int, message: Text, req: Requete) -> WebResultat { return WebResultat.WebEchec(erreur_http(code,"IA",message,requete_id(req))) }
 fn ia_health(_r: Requete, _p: Map<Text>) -> WebResultat { return WebResultat.WebOk(reponse_json("{\"status\":\"ok\",\"service\":\"ia\",\"runtime\":\"nolc\"}")) }
 fn parametre(p: Map<Text>, k: Text) -> Text { return unwrap_or(map_get(p,k),"") }
+fn ia_cout(provider: Text, entree: Int, sortie: Int) -> Int {
+    let prefix = "NOLCORE_" + upper(provider)
+    let in_rate = unwrap_or(parse_int(unwrap_or(env(prefix + "_INPUT_MICROS_PER_1K"),"0")),0)
+    let out_rate = unwrap_or(parse_int(unwrap_or(env(prefix + "_OUTPUT_MICROS_PER_1K"),"0")),0)
+    return (entree * in_rate) / 1000 + (sortie * out_rate) / 1000
+}
 fn ia_run(req: Requete, p: Map<Text>) -> WebResultat {
     let provider=parametre(p,"nameid"); let model=parametre(p,"modelia"); let text_input=parametre(p,"text")
     if provider=="" or model=="" or text_input=="" { return ia_erreur(422,"provider, model et text obligatoires",req) }
@@ -16,7 +22,13 @@ fn ia_run(req: Requete, p: Map<Text>) -> WebResultat {
     if token=="" { return ia_erreur(503,"Token fournisseur absent",req) }
     let rep=http_post_token(url,"application/json","{\"model\":"+json_texte(model)+",\"messages\":[{\"role\":\"user\",\"content\":"+json_texte(text_input)+"}]}",token)
     if not has(rep) or unwrap_or(rep,ReponseHttp {statut:0,entetes:"",corps:""}).statut>=300 { return ia_erreur(502,"Fournisseur IA indisponible",req) }
-    return WebResultat.WebOk(reponse_json("{\"provider\":"+json_texte(provider)+",\"model\":"+json_texte(model)+",\"result\":"+json_texte(unwrap_or(rep,ReponseHttp {statut:200,entetes:"",corps:""}).corps)+"}"))
+    let raw = unwrap_or(rep,ReponseHttp {statut:200,entetes:"",corps:""}).corps
+    var entree = unwrap_or(json_chemin_int(raw,"usage.prompt_tokens"),0)
+    var sortie = unwrap_or(json_chemin_int(raw,"usage.completion_tokens"),0)
+    if entree == 0 { entree = unwrap_or(json_chemin_int(raw,"usage.input_tokens"),0) }
+    if sortie == 0 { sortie = unwrap_or(json_chemin_int(raw,"usage.output_tokens"),0) }
+    let cout = ia_cout(provider,entree,sortie)
+    return WebResultat.WebOk(reponse_json("{\"provider\":"+json_texte(provider)+",\"model\":"+json_texte(model)+",\"input_tokens\":"+text(entree)+",\"output_tokens\":"+text(sortie)+",\"estimated_cost_micros\":"+text(cout)+",\"result\":"+json_texte(raw)+"}"))
 }
 fn ia_run_body(req: Requete, _p: Map<Text>) -> WebResultat {
     let body = requete_json(req)
