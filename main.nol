@@ -63,7 +63,12 @@ fn ia_modeles(_req: Requete, _p: Map<Text>) -> WebResultat {
     var items = "["; var sep = ""
     for provider in ["chatgpt","claude","mistral","gemini"] {
         let part = ia_modeles_provider(provider)
-        if part != "[]" { items += sep + sub(part,1,len(part)-1); sep = "," }
+        // sub(texte, debut, LONGUEUR) et non (debut, fin) : pour retirer le
+        // « [ » de tete et le « ] » de fin d'un tableau de N caracteres, il
+        // faut prendre N-2 caracteres a partir de l'indice 1, pas N-1 (sinon
+        // le « ] » de fin reste, cassant le JSON dès qu'un 2e fournisseur
+        // s'ajoute : « [...],{"provider":... » sans « [ » avant la virgule).
+        if part != "[]" { items += sep + sub(part,1,len(part)-2); sep = "," }
     }
     return WebResultat.WebOk(reponse_json(items + "]"))
 }
