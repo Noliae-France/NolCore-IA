@@ -121,7 +121,7 @@ fn ia_extraire_delta(payload: Text, provider: Text) -> Text {
 // Ouvre le flux HTTPS du fournisseur (corps déjà en stream:true) et REVERSE
 // chaque token vers le client SSE `f` au fil de l'eau. Robuste : toute erreur
 // émet un événement `error` puis termine ; jamais de blocage (timeout 60 s).
-fn ia_pump(f: Int, url: Text, body: Text, auth: Text, provider: Text) {
+fn ia_pump(f: Int, url: Text, body: Text, auth: Text, provider: Text, in_est: Int) {
     let ourl = url_parse(url)
     if not has(ourl) { let _e = tcp_write(f, "event: error\ndata: {\"error\":\"url invalide\"}\n\n"); return }
     let u = unwrap_or(ourl, UrlParties { schema: "", hote: "", port: 0, chemin: "" })
@@ -142,6 +142,9 @@ fn ia_pump(f: Int, url: Text, body: Text, auth: Text, provider: Text) {
     var entetes_finies = false
     var fini = false
     var tours = 0
+    var usage_in = 0
+    var usage_out = 0
+    var out_chars = 0
     while not fini and tours < 100000 {
         let morceau = tls_lire(ssl)
         if morceau == "" {
@@ -165,8 +168,19 @@ fn ia_pump(f: Int, url: Text, body: Text, auth: Text, provider: Text) {
                         } else {
                             let delta = ia_extraire_delta(payload, provider)
                             if delta != "" {
+                                out_chars = out_chars + len(delta)
                                 let _w = tcp_write(f, "data: {\"delta\":" + json_texte(delta) + "}\n\n")
                             }
+                            let ui = json_chemin_int(payload, "usage.prompt_tokens")
+                            if has(ui) { usage_in = unwrap_or(ui, usage_in) }
+                            let uo = json_chemin_int(payload, "usage.completion_tokens")
+                            if has(uo) { usage_out = unwrap_or(uo, usage_out) }
+                            let ci = json_chemin_int(payload, "message.usage.input_tokens")
+                            if has(ci) { usage_in = unwrap_or(ci, usage_in) }
+                            let ci2 = json_chemin_int(payload, "usage.input_tokens")
+                            if has(ci2) and unwrap_or(ci2, 0) > 0 { usage_in = unwrap_or(ci2, usage_in) }
+                            let co2 = json_chemin_int(payload, "usage.output_tokens")
+                            if has(co2) and unwrap_or(co2, 0) > 0 { usage_out = unwrap_or(co2, usage_out) }
                         }
                     }
                     nl = find(buf, "\n")
@@ -175,6 +189,9 @@ fn ia_pump(f: Int, url: Text, body: Text, auth: Text, provider: Text) {
         }
         tours = tours + 1
     }
+    if usage_in <= 0 { usage_in = in_est }
+    if usage_out <= 0 { usage_out = out_chars / 4 }
+    let _u = tcp_write(f, "data: {\"nolcore_usage\":{\"in\":" + text(usage_in) + ",\"out\":" + text(usage_out) + "}}\n\n")
     let _done = tcp_write(f, "data: [DONE]\n\n")
     tls_fermer(ssl); tls_liberer_contexte(ctx); tcp_close(fd)
 }
@@ -206,11 +223,15 @@ fn ia_stream(f: Int, raw: Text) {
     }
     var body = "{\"model\":" + json_texte(model) + ",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(text_input) + "}]}"
     var auth = token
+    if provider == "chatgpt" or provider == "openai" {
+        body = "{\"model\":" + json_texte(model) + ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(text_input) + "}]}"
+    }
     if provider == "claude" {
         body = "{\"model\":" + json_texte(model) + ",\"max_tokens\":1024,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(text_input) + "}]}"
         auth = "X-Api-Key " + token
     }
-    ia_pump(f, url, body, auth, provider)
+    let in_est = len(text_input) / 4
+    ia_pump(f, url, body, auth, provider, in_est)
     tcp_close(f)
 }
 
