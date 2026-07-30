@@ -5,10 +5,37 @@ import "vendor/nolc/lib/http_client.nol"
 fn ia_erreur(code: Int, message: Text, req: Requete) -> WebResultat { return WebResultat.WebEchec(erreur_http(code,"IA",message,requete_id(req))) }
 fn ia_health(_r: Requete, _p: Map<Text>) -> WebResultat { return WebResultat.WebOk(reponse_json("{\"status\":\"ok\",\"service\":\"ia\",\"runtime\":\"nolc\"}")) }
 fn parametre(p: Map<Text>, k: Text) -> Text { return unwrap_or(map_get(p,k),"") }
+fn ia_label(provider: Text) -> Text {
+    if provider == "chatgpt" or provider == "openai" { return "ChatGPT" }
+    if provider == "claude" { return "Claude" }
+    if provider == "mistral" { return "Mistral" }
+    if provider == "gemini" { return "Gemini" }
+    return provider
+}
+
+fn ia_modele_json(provider: Text, model: Text) -> Text {
+    return "{\"provider\":" + json_texte(provider) + ",\"model\":" + json_texte(model) + ",\"label\":" + json_texte(ia_label(provider)) + "}"
+}
+
+// Liste les modèles d'UN fournisseur. Vide si le fournisseur n'a pas de token
+// (donc non configuré = non affiché). Sinon, TOUS ses modèles disponibles.
 fn ia_modeles_provider(provider: Text) -> Text {
     let prefix = "NOLCORE_" + upper(provider)
     let token = unwrap_or(env(prefix + "_TOKEN"),"")
     if token == "" { return "[]" }
+    // Anthropic : /v1/models exige l'en-tête anthropic-version que le client
+    // simple ne pose pas ; on expose un jeu de modèles connus quand la clé
+    // est présente (surchargeable via NOLCORE_CLAUDE_MODELS, séparés par des virgules).
+    if provider == "claude" {
+        var liste = unwrap_or(env("NOLCORE_CLAUDE_MODELS"), "")
+        if liste == "" { liste = "claude-3-5-sonnet-latest,claude-3-5-haiku-latest,claude-3-opus-latest" }
+        var cl = "["; var s2 = ""
+        for md in split(liste, ",") {
+            let mdt = trim(md)
+            if mdt != "" { cl += s2 + ia_modele_json(provider, mdt); s2 = "," }
+        }
+        return cl + "]"
+    }
     var url = unwrap_or(env(prefix + "_MODELS_URL"),"")
     if url == "" and (provider == "chatgpt" or provider == "openai") { url = "https://api.openai.com/v1/models" }
     if url == "" and provider == "mistral" { url = "https://api.mistral.ai/v1/models" }
@@ -22,17 +49,19 @@ fn ia_modeles_provider(provider: Text) -> Text {
     var key = "data"
     if provider == "gemini" { key = "models" }
     var out = "["; var sep = ""; var i = 0
-    while i < 100 {
+    while i < 200 {
         var name = json_chemin_texte(raw,key + "." + text(i) + ".id")
         if provider == "gemini" { name = json_chemin_texte(raw,key + "." + text(i) + ".name") }
         if not has(name) or unwrap_or(name,"") == "" { break }
-        out += sep + "{\"provider\":" + json_texte(provider) + ",\"model\":" + json_texte(unwrap_or(name,"")) + "}"; sep = ","; i = i + 1
+        var mv = unwrap_or(name,"")
+        if provider == "gemini" and starts_with(mv, "models/") { mv = sub(mv, 7, len(mv)) }
+        out += sep + ia_modele_json(provider, mv); sep = ","; i = i + 1
     }
     return out + "]"
 }
 fn ia_modeles(_req: Requete, _p: Map<Text>) -> WebResultat {
     var items = "["; var sep = ""
-    for provider in ["chatgpt","mistral","gemini"] {
+    for provider in ["chatgpt","claude","mistral","gemini"] {
         let part = ia_modeles_provider(provider)
         if part != "[]" { items += sep + sub(part,1,len(part)-1); sep = "," }
     }
@@ -76,5 +105,135 @@ fn ia_run_body(req: Requete, _p: Map<Text>) -> WebResultat {
     map_set(p,"text",unwrap_or(json_texte_champ(unwrap_or(body,""),"text"),""))
     return ia_run(req,p)
 }
+// Extrait le fragment de texte (« delta ») d'un événement SSE fournisseur.
+// OpenAI/Mistral : choices[0].delta.content ; Anthropic : delta.text.
+fn ia_extraire_delta(payload: Text, provider: Text) -> Text {
+    if provider == "claude" {
+        return unwrap_or(json_chemin_texte(payload, "delta.text"), "")
+    }
+    let d = json_chemin_texte(payload, "choices.0.delta.content")
+    if has(d) {
+        return unwrap_or(d, "")
+    }
+    return unwrap_or(json_chemin_texte(payload, "choices.0.message.content"), "")
+}
+
+// Ouvre le flux HTTPS du fournisseur (corps déjà en stream:true) et REVERSE
+// chaque token vers le client SSE `f` au fil de l'eau. Robuste : toute erreur
+// émet un événement `error` puis termine ; jamais de blocage (timeout 60 s).
+fn ia_pump(f: Int, url: Text, body: Text, auth: Text, provider: Text, in_est: Int) {
+    let ourl = url_parse(url)
+    if not has(ourl) { let _e = tcp_write(f, "event: error\ndata: {\"error\":\"url invalide\"}\n\n"); return }
+    let u = unwrap_or(ourl, UrlParties { schema: "", hote: "", port: 0, chemin: "" })
+    let oreq = hc_construire_requete("POST", u, "application/json", body, auth)
+    if not has(oreq) { let _e = tcp_write(f, "event: error\ndata: {\"error\":\"requete invalide\"}\n\n"); return }
+    let co = tcp_connect(u.hote, u.port)
+    if not has(co) { let _e = tcp_write(f, "event: error\ndata: {\"error\":\"connexion fournisseur\"}\n\n"); return }
+    let fd = unwrap_or(co, -1)
+    tcp_set_timeout(fd, 60000)
+    let octx = tls_client_contexte()
+    if not has(octx) { tcp_close(fd); let _e = tcp_write(f, "event: error\ndata: {\"error\":\"tls\"}\n\n"); return }
+    let ctx = unwrap_or(octx, ptr_null())
+    let ossl = tls_connecter(ctx, fd, u.hote)
+    if not has(ossl) { tls_liberer_contexte(ctx); tcp_close(fd); let _e = tcp_write(f, "event: error\ndata: {\"error\":\"tls connect\"}\n\n"); return }
+    let ssl = unwrap_or(ossl, ptr_null())
+    if tls_ecrire(ssl, unwrap_or(oreq, "")) <= 0 { tls_fermer(ssl); tls_liberer_contexte(ctx); tcp_close(fd); let _e = tcp_write(f, "event: error\ndata: {\"error\":\"envoi\"}\n\n"); return }
+    var buf = ""
+    var entetes_finies = false
+    var fini = false
+    var tours = 0
+    var usage_in = 0
+    var usage_out = 0
+    var out_chars = 0
+    while not fini and tours < 100000 {
+        let morceau = tls_lire(ssl)
+        if morceau == "" {
+            fini = true
+        } else {
+            buf = buf + morceau
+            if not entetes_finies {
+                let sep = find(buf, "\r\n\r\n")
+                if has(sep) { buf = sub(buf, unwrap_or(sep, 0) + 4, len(buf)); entetes_finies = true }
+            }
+            if entetes_finies {
+                var nl = find(buf, "\n")
+                while has(nl) and not fini {
+                    let i = unwrap_or(nl, 0)
+                    let ligne = trim(sub(buf, 0, i))
+                    buf = sub(buf, i + 1, len(buf))
+                    if starts_with(ligne, "data:") {
+                        let payload = trim(sub(ligne, 5, len(ligne)))
+                        if payload == "[DONE]" {
+                            fini = true
+                        } else {
+                            let delta = ia_extraire_delta(payload, provider)
+                            if delta != "" {
+                                out_chars = out_chars + len(delta)
+                                let _w = tcp_write(f, "data: {\"delta\":" + json_texte(delta) + "}\n\n")
+                            }
+                            let ui = json_chemin_int(payload, "usage.prompt_tokens")
+                            if has(ui) { usage_in = unwrap_or(ui, usage_in) }
+                            let uo = json_chemin_int(payload, "usage.completion_tokens")
+                            if has(uo) { usage_out = unwrap_or(uo, usage_out) }
+                            let ci = json_chemin_int(payload, "message.usage.input_tokens")
+                            if has(ci) { usage_in = unwrap_or(ci, usage_in) }
+                            let ci2 = json_chemin_int(payload, "usage.input_tokens")
+                            if has(ci2) and unwrap_or(ci2, 0) > 0 { usage_in = unwrap_or(ci2, usage_in) }
+                            let co2 = json_chemin_int(payload, "usage.output_tokens")
+                            if has(co2) and unwrap_or(co2, 0) > 0 { usage_out = unwrap_or(co2, usage_out) }
+                        }
+                    }
+                    nl = find(buf, "\n")
+                }
+            }
+        }
+        tours = tours + 1
+    }
+    if usage_in <= 0 { usage_in = in_est }
+    if usage_out <= 0 { usage_out = out_chars / 4 }
+    let _u = tcp_write(f, "data: {\"nolcore_usage\":{\"in\":" + text(usage_in) + ",\"out\":" + text(usage_out) + "}}\n\n")
+    let _done = tcp_write(f, "data: [DONE]\n\n")
+    tls_fermer(ssl); tls_liberer_contexte(ctx); tcp_close(fd)
+}
+
+// Handler SSE bas niveau : écrit directement dans le socket client `f`
+// (le framework requête->réponse ne sait pas streamer). Ferme `f` lui-même.
+fn ia_stream(f: Int, raw: Text) {
+    let entete = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n"
+    let _h = tcp_write(f, entete)
+    let sep = find(raw, "\r\n\r\n")
+    var body_in = ""
+    if has(sep) { body_in = sub(raw, unwrap_or(sep, 0) + 4, len(raw)) }
+    let provider = unwrap_or(json_texte_champ(body_in, "provider"), "")
+    let model = unwrap_or(json_texte_champ(body_in, "model"), "")
+    let text_input = unwrap_or(json_texte_champ(body_in, "text"), "")
+    if provider == "" or model == "" or text_input == "" {
+        let _e = tcp_write(f, "event: error\ndata: {\"error\":\"provider, model et text obligatoires\"}\n\n")
+        tcp_close(f); return
+    }
+    let prefix = "NOLCORE_" + upper(provider)
+    let token = unwrap_or(env(prefix + "_TOKEN"), "")
+    var url = unwrap_or(env(prefix + "_URL"), "")
+    if url == "" and (provider == "chatgpt" or provider == "openai") { url = "https://api.openai.com/v1/chat/completions" }
+    if url == "" and provider == "claude" { url = "https://api.anthropic.com/v1/messages" }
+    if url == "" and provider == "mistral" { url = "https://api.mistral.ai/v1/chat/completions" }
+    if token == "" {
+        let _e = tcp_write(f, "event: error\ndata: {\"error\":\"token fournisseur absent\"}\n\n")
+        tcp_close(f); return
+    }
+    var body = "{\"model\":" + json_texte(model) + ",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(text_input) + "}]}"
+    var auth = token
+    if provider == "chatgpt" or provider == "openai" {
+        body = "{\"model\":" + json_texte(model) + ",\"stream\":true,\"stream_options\":{\"include_usage\":true},\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(text_input) + "}]}"
+    }
+    if provider == "claude" {
+        body = "{\"model\":" + json_texte(model) + ",\"max_tokens\":1024,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(text_input) + "}]}"
+        auth = "X-Api-Key " + token
+    }
+    let in_est = len(text_input) / 4
+    ia_pump(f, url, body, auth, provider, in_est)
+    tcp_close(f)
+}
+
 fn application(req: Requete) -> WebResultat { var m: List<Text> = []; var p: List<Text> = []; var h: List<Fn(Requete, Map<Text>) -> WebResultat> = []; route_type(m,p,h,"GET","/api/health",ia_health); route_type(m,p,h,"GET","/v1/ia/models",ia_modeles); route_type(m,p,h,"POST","/v1/ia",ia_run_body); route_type(m,p,h,"POST","/v1/ia/:nameid/:modelia/:text",ia_run); return routeur_dispatch_type(m,p,h,req) }
-fn main() { let port=unwrap_or(parse_int(unwrap_or(env("NOLIAE_PORT"),"8092")),8092); let l=tcp_listen(port); if not has(l){return}; let s=unwrap_or(l,-1); var middlewares: List<Fn(Requete,Reponse) -> Reponse> = []; while true { let a=tcp_accept(s); if has(a){let f=unwrap_or(a,-1); let raw=unwrap_or(tcp_read(f),""); let rep=web_repondre_resultat(raw,web_limites_defaut(),application,middlewares); let _w=tcp_write(f,rep); tcp_close(f)}} }
+fn main() { let port=unwrap_or(parse_int(unwrap_or(env("NOLIAE_PORT"),"8092")),8092); let l=tcp_listen(port); if not has(l){return}; let s=unwrap_or(l,-1); var middlewares: List<Fn(Requete,Reponse) -> Reponse> = []; while true { let a=tcp_accept(s); if has(a){let f=unwrap_or(a,-1); let raw=unwrap_or(tcp_read(f),""); if starts_with(raw,"POST /v1/ia/stream") { ia_stream(f,raw) } else { let rep=web_repondre_resultat(raw,web_limites_defaut(),application,middlewares); let _w=tcp_write(f,rep); tcp_close(f) } }} }
