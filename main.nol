@@ -76,5 +76,114 @@ fn ia_run_body(req: Requete, _p: Map<Text>) -> WebResultat {
     map_set(p,"text",unwrap_or(json_texte_champ(unwrap_or(body,""),"text"),""))
     return ia_run(req,p)
 }
+// Extrait le fragment de texte (« delta ») d'un événement SSE fournisseur.
+// OpenAI/Mistral : choices[0].delta.content ; Anthropic : delta.text.
+fn ia_extraire_delta(payload: Text, provider: Text) -> Text {
+    if provider == "claude" {
+        return unwrap_or(json_chemin_texte(payload, "delta.text"), "")
+    }
+    let d = json_chemin_texte(payload, "choices.0.delta.content")
+    if has(d) {
+        return unwrap_or(d, "")
+    }
+    return unwrap_or(json_chemin_texte(payload, "choices.0.message.content"), "")
+}
+
+// Ouvre le flux HTTPS du fournisseur (corps déjà en stream:true) et REVERSE
+// chaque token vers le client SSE `f` au fil de l'eau. Robuste : toute erreur
+// émet un événement `error` puis termine ; jamais de blocage (timeout 60 s).
+fn ia_pump(f: Int, url: Text, body: Text, auth: Text, provider: Text) {
+    let ourl = url_parse(url)
+    if not has(ourl) { let _e = tcp_write(f, "event: error\ndata: {\"error\":\"url invalide\"}\n\n"); return }
+    let u = unwrap_or(ourl, UrlParties { schema: "", hote: "", port: 0, chemin: "" })
+    let oreq = hc_construire_requete("POST", u, "application/json", body, auth)
+    if not has(oreq) { let _e = tcp_write(f, "event: error\ndata: {\"error\":\"requete invalide\"}\n\n"); return }
+    let co = tcp_connect(u.hote, u.port)
+    if not has(co) { let _e = tcp_write(f, "event: error\ndata: {\"error\":\"connexion fournisseur\"}\n\n"); return }
+    let fd = unwrap_or(co, -1)
+    tcp_set_timeout(fd, 60000)
+    let octx = tls_client_contexte()
+    if not has(octx) { tcp_close(fd); let _e = tcp_write(f, "event: error\ndata: {\"error\":\"tls\"}\n\n"); return }
+    let ctx = unwrap_or(octx, ptr_null())
+    let ossl = tls_connecter(ctx, fd, u.hote)
+    if not has(ossl) { tls_liberer_contexte(ctx); tcp_close(fd); let _e = tcp_write(f, "event: error\ndata: {\"error\":\"tls connect\"}\n\n"); return }
+    let ssl = unwrap_or(ossl, ptr_null())
+    if tls_ecrire(ssl, unwrap_or(oreq, "")) <= 0 { tls_fermer(ssl); tls_liberer_contexte(ctx); tcp_close(fd); let _e = tcp_write(f, "event: error\ndata: {\"error\":\"envoi\"}\n\n"); return }
+    var buf = ""
+    var entetes_finies = false
+    var fini = false
+    var tours = 0
+    while not fini and tours < 100000 {
+        let morceau = tls_lire(ssl)
+        if morceau == "" {
+            fini = true
+        } else {
+            buf = buf + morceau
+            if not entetes_finies {
+                let sep = find(buf, "\r\n\r\n")
+                if has(sep) { buf = sub(buf, unwrap_or(sep, 0) + 4, len(buf)); entetes_finies = true }
+            }
+            if entetes_finies {
+                var nl = find(buf, "\n")
+                while has(nl) and not fini {
+                    let i = unwrap_or(nl, 0)
+                    let ligne = trim(sub(buf, 0, i))
+                    buf = sub(buf, i + 1, len(buf))
+                    if starts_with(ligne, "data:") {
+                        let payload = trim(sub(ligne, 5, len(ligne)))
+                        if payload == "[DONE]" {
+                            fini = true
+                        } else {
+                            let delta = ia_extraire_delta(payload, provider)
+                            if delta != "" {
+                                let _w = tcp_write(f, "data: {\"delta\":" + json_texte(delta) + "}\n\n")
+                            }
+                        }
+                    }
+                    nl = find(buf, "\n")
+                }
+            }
+        }
+        tours = tours + 1
+    }
+    let _done = tcp_write(f, "data: [DONE]\n\n")
+    tls_fermer(ssl); tls_liberer_contexte(ctx); tcp_close(fd)
+}
+
+// Handler SSE bas niveau : écrit directement dans le socket client `f`
+// (le framework requête->réponse ne sait pas streamer). Ferme `f` lui-même.
+fn ia_stream(f: Int, raw: Text) {
+    let entete = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n"
+    let _h = tcp_write(f, entete)
+    let sep = find(raw, "\r\n\r\n")
+    var body_in = ""
+    if has(sep) { body_in = sub(raw, unwrap_or(sep, 0) + 4, len(raw)) }
+    let provider = unwrap_or(json_texte_champ(body_in, "provider"), "")
+    let model = unwrap_or(json_texte_champ(body_in, "model"), "")
+    let text_input = unwrap_or(json_texte_champ(body_in, "text"), "")
+    if provider == "" or model == "" or text_input == "" {
+        let _e = tcp_write(f, "event: error\ndata: {\"error\":\"provider, model et text obligatoires\"}\n\n")
+        tcp_close(f); return
+    }
+    let prefix = "NOLCORE_" + upper(provider)
+    let token = unwrap_or(env(prefix + "_TOKEN"), "")
+    var url = unwrap_or(env(prefix + "_URL"), "")
+    if url == "" and (provider == "chatgpt" or provider == "openai") { url = "https://api.openai.com/v1/chat/completions" }
+    if url == "" and provider == "claude" { url = "https://api.anthropic.com/v1/messages" }
+    if url == "" and provider == "mistral" { url = "https://api.mistral.ai/v1/chat/completions" }
+    if token == "" {
+        let _e = tcp_write(f, "event: error\ndata: {\"error\":\"token fournisseur absent\"}\n\n")
+        tcp_close(f); return
+    }
+    var body = "{\"model\":" + json_texte(model) + ",\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(text_input) + "}]}"
+    var auth = token
+    if provider == "claude" {
+        body = "{\"model\":" + json_texte(model) + ",\"max_tokens\":1024,\"stream\":true,\"messages\":[{\"role\":\"user\",\"content\":" + json_texte(text_input) + "}]}"
+        auth = "X-Api-Key " + token
+    }
+    ia_pump(f, url, body, auth, provider)
+    tcp_close(f)
+}
+
 fn application(req: Requete) -> WebResultat { var m: List<Text> = []; var p: List<Text> = []; var h: List<Fn(Requete, Map<Text>) -> WebResultat> = []; route_type(m,p,h,"GET","/api/health",ia_health); route_type(m,p,h,"GET","/v1/ia/models",ia_modeles); route_type(m,p,h,"POST","/v1/ia",ia_run_body); route_type(m,p,h,"POST","/v1/ia/:nameid/:modelia/:text",ia_run); return routeur_dispatch_type(m,p,h,req) }
-fn main() { let port=unwrap_or(parse_int(unwrap_or(env("NOLIAE_PORT"),"8092")),8092); let l=tcp_listen(port); if not has(l){return}; let s=unwrap_or(l,-1); var middlewares: List<Fn(Requete,Reponse) -> Reponse> = []; while true { let a=tcp_accept(s); if has(a){let f=unwrap_or(a,-1); let raw=unwrap_or(tcp_read(f),""); let rep=web_repondre_resultat(raw,web_limites_defaut(),application,middlewares); let _w=tcp_write(f,rep); tcp_close(f)}} }
+fn main() { let port=unwrap_or(parse_int(unwrap_or(env("NOLIAE_PORT"),"8092")),8092); let l=tcp_listen(port); if not has(l){return}; let s=unwrap_or(l,-1); var middlewares: List<Fn(Requete,Reponse) -> Reponse> = []; while true { let a=tcp_accept(s); if has(a){let f=unwrap_or(a,-1); let raw=unwrap_or(tcp_read(f),""); if starts_with(raw,"POST /v1/ia/stream") { ia_stream(f,raw) } else { let rep=web_repondre_resultat(raw,web_limites_defaut(),application,middlewares); let _w=tcp_write(f,rep); tcp_close(f) } }} }
