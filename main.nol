@@ -5,10 +5,37 @@ import "vendor/nolc/lib/http_client.nol"
 fn ia_erreur(code: Int, message: Text, req: Requete) -> WebResultat { return WebResultat.WebEchec(erreur_http(code,"IA",message,requete_id(req))) }
 fn ia_health(_r: Requete, _p: Map<Text>) -> WebResultat { return WebResultat.WebOk(reponse_json("{\"status\":\"ok\",\"service\":\"ia\",\"runtime\":\"nolc\"}")) }
 fn parametre(p: Map<Text>, k: Text) -> Text { return unwrap_or(map_get(p,k),"") }
+fn ia_label(provider: Text) -> Text {
+    if provider == "chatgpt" or provider == "openai" { return "ChatGPT" }
+    if provider == "claude" { return "Claude" }
+    if provider == "mistral" { return "Mistral" }
+    if provider == "gemini" { return "Gemini" }
+    return provider
+}
+
+fn ia_modele_json(provider: Text, model: Text) -> Text {
+    return "{\"provider\":" + json_texte(provider) + ",\"model\":" + json_texte(model) + ",\"label\":" + json_texte(ia_label(provider)) + "}"
+}
+
+// Liste les modèles d'UN fournisseur. Vide si le fournisseur n'a pas de token
+// (donc non configuré = non affiché). Sinon, TOUS ses modèles disponibles.
 fn ia_modeles_provider(provider: Text) -> Text {
     let prefix = "NOLCORE_" + upper(provider)
     let token = unwrap_or(env(prefix + "_TOKEN"),"")
     if token == "" { return "[]" }
+    // Anthropic : /v1/models exige l'en-tête anthropic-version que le client
+    // simple ne pose pas ; on expose un jeu de modèles connus quand la clé
+    // est présente (surchargeable via NOLCORE_CLAUDE_MODELS, séparés par des virgules).
+    if provider == "claude" {
+        var liste = unwrap_or(env("NOLCORE_CLAUDE_MODELS"), "")
+        if liste == "" { liste = "claude-3-5-sonnet-latest,claude-3-5-haiku-latest,claude-3-opus-latest" }
+        var cl = "["; var s2 = ""
+        for md in split(liste, ",") {
+            let mdt = trim(md)
+            if mdt != "" { cl += s2 + ia_modele_json(provider, mdt); s2 = "," }
+        }
+        return cl + "]"
+    }
     var url = unwrap_or(env(prefix + "_MODELS_URL"),"")
     if url == "" and (provider == "chatgpt" or provider == "openai") { url = "https://api.openai.com/v1/models" }
     if url == "" and provider == "mistral" { url = "https://api.mistral.ai/v1/models" }
@@ -22,17 +49,19 @@ fn ia_modeles_provider(provider: Text) -> Text {
     var key = "data"
     if provider == "gemini" { key = "models" }
     var out = "["; var sep = ""; var i = 0
-    while i < 100 {
+    while i < 200 {
         var name = json_chemin_texte(raw,key + "." + text(i) + ".id")
         if provider == "gemini" { name = json_chemin_texte(raw,key + "." + text(i) + ".name") }
         if not has(name) or unwrap_or(name,"") == "" { break }
-        out += sep + "{\"provider\":" + json_texte(provider) + ",\"model\":" + json_texte(unwrap_or(name,"")) + "}"; sep = ","; i = i + 1
+        var mv = unwrap_or(name,"")
+        if provider == "gemini" and starts_with(mv, "models/") { mv = sub(mv, 7, len(mv)) }
+        out += sep + ia_modele_json(provider, mv); sep = ","; i = i + 1
     }
     return out + "]"
 }
 fn ia_modeles(_req: Requete, _p: Map<Text>) -> WebResultat {
     var items = "["; var sep = ""
-    for provider in ["chatgpt","mistral","gemini"] {
+    for provider in ["chatgpt","claude","mistral","gemini"] {
         let part = ia_modeles_provider(provider)
         if part != "[]" { items += sep + sub(part,1,len(part)-1); sep = "," }
     }
