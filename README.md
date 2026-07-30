@@ -157,6 +157,12 @@ La vérification de la chaîne API + IA + Crawler est exécutée dans
 - Configurez délais, limites de sortie réseau et journalisation selon vos
   contraintes de production.
 
+## Contrat avec les frontends
+
+NolCore-IA n’est jamais appelé directement depuis le navigateur. Les
+frontends NHTML appellent le Core avec le cookie de session ; le Core vérifie
+l’identité, les droits et les quotas avant de déléguer sur le réseau interne.
+
 ## Écosystème et licence
 
 - [NolCore](https://github.com/Noliae-France/NolCore) — stack complète et CI
