@@ -51,11 +51,47 @@ fn ia_modele_instantane_date(nom: Text) -> Bool {
     return false
 }
 
+fn ia_chiffre(c: Text) -> Bool { return contains("0123456789", c) }
+
+// Code de génération pour un modèle « gpt-<majeur>[.<mineur>]... » (majeur*100
+// + mineur), ou none si le nom ne commence pas par un numéro de génération
+// juste après « gpt- ». Permet de ne garder que la DERNIÈRE génération GPT
+// au lieu de toute la traîne gpt-3.5/gpt-4/gpt-4.1/gpt-5/gpt-5.1/... encore
+// listée par l'API une fois les instantanés datés déjà filtrés.
+fn ia_gpt_generation(nom: Text) -> Option<Int> {
+    if not starts_with(nom, "gpt-") { return none }
+    let reste = sub(nom, 4, len(nom) - 4)
+    var i = 0
+    while i < len(reste) and ia_chiffre(sub(reste,i,1)) { i = i + 1 }
+    if i == 0 { return none }
+    let majeur = unwrap_or(parse_int(sub(reste,0,i)), 0)
+    var mineur = 0
+    if i < len(reste) and sub(reste,i,1) == "." {
+        var j = i + 1
+        while j < len(reste) and ia_chiffre(sub(reste,j,1)) { j = j + 1 }
+        if j > i + 1 { mineur = unwrap_or(parse_int(sub(reste,i+1,j-i-1)), 0) }
+    }
+    return some(majeur * 100 + mineur)
+}
+
+// Même idée pour la série « raisonnement » o1/o3/o4/... (nom commençant par
+// « o » suivi d'un chiffre).
+fn ia_o_generation(nom: Text) -> Option<Int> {
+    if len(nom) < 2 or sub(nom,0,1) != "o" or not ia_chiffre(sub(nom,1,1)) { return none }
+    var i = 1
+    while i < len(nom) and ia_chiffre(sub(nom,i,1)) { i = i + 1 }
+    return some(unwrap_or(parse_int(sub(nom,1,i-1)), 0))
+}
+
 // Vrai pour un modèle « par défaut » raisonnable (nom court, sans suffixe de
 // date/version) : place ces entrées en tête de liste, pour que le PREMIER
 // modèle affiché/sélectionné par le front soit toujours utilisable.
 fn ia_modele_prioritaire(provider: Text, nom: Text) -> Bool {
-    if provider == "chatgpt" or provider == "openai" { return nom == "gpt-4o-mini" or nom == "gpt-4o" or nom == "gpt-5-mini" or nom == "gpt-5" }
+    // "mini" plutôt qu'un nom de génération figé (gpt-4o-mini, gpt-5-mini...) :
+    // la génération réellement disponible change avec le catalogue, mais la
+    // variante « mini » (rapide/économique) reste le bon choix par défaut
+    // quelle que soit la génération retenue par le filtre ci-dessus.
+    if provider == "chatgpt" or provider == "openai" { return contains(nom, "mini") }
     if provider == "mistral" { return nom == "mistral-small-latest" or nom == "mistral-large-latest" or nom == "mistral-medium-latest" }
     if provider == "gemini" { return contains(lower(nom), "flash") }
     return false
@@ -93,9 +129,12 @@ fn ia_modeles_provider(provider: Text) -> Text {
     let raw = unwrap_or(rep,ReponseHttp {statut:0,entetes:"",corps:""}).corps
     var key = "data"
     if provider == "gemini" { key = "models" }
-    // Deux compartiments : modèles « courants » en tête, le reste ensuite.
-    var tete = ""; var sep_tete = ""
-    var reste = ""; var sep_reste = ""
+    // Passe 1 : ne garde que les modèles de chat non datés, et pour ChatGPT
+    // repère au passage la génération la plus récente (gpt-X.Y et o-N sont
+    // deux lignées parallèles, chacune avec sa propre « dernière »).
+    var candidats: List<Text> = []
+    var max_gpt = -1
+    var max_o = -1
     var i = 0
     while i < 200 {
         var name = json_chemin_texte(raw,key + "." + text(i) + ".id")
@@ -104,10 +143,34 @@ fn ia_modeles_provider(provider: Text) -> Text {
         var mv = unwrap_or(name,"")
         if provider == "gemini" and starts_with(mv, "models/") { mv = sub(mv, 7, len(mv)) }
         if ia_modele_est_chat(mv) and not ia_modele_instantane_date(mv) {
+            push(candidats, mv)
+            if provider == "chatgpt" or provider == "openai" {
+                let gg = ia_gpt_generation(mv)
+                if has(gg) and unwrap_or(gg,0) > max_gpt { max_gpt = unwrap_or(gg,0) }
+                let og = ia_o_generation(mv)
+                if has(og) and unwrap_or(og,0) > max_o { max_o = unwrap_or(og,0) }
+            }
+        }
+        i = i + 1
+    }
+    // Passe 2 : pour ChatGPT, ne garde que la dernière génération de chaque
+    // lignée (gpt-*, o-*) ; les noms qui n'appartiennent à aucune des deux
+    // (ex: "chat-latest") passent tels quels. Deux compartiments : modèles
+    // « courants » en tête, le reste ensuite.
+    var tete = ""; var sep_tete = ""
+    var reste = ""; var sep_reste = ""
+    for mv in candidats {
+        var garder = true
+        if provider == "chatgpt" or provider == "openai" {
+            let gg = ia_gpt_generation(mv)
+            let og = ia_o_generation(mv)
+            if has(gg) { garder = unwrap_or(gg,0) == max_gpt }
+            else if has(og) { garder = unwrap_or(og,0) == max_o }
+        }
+        if garder {
             if ia_modele_prioritaire(provider, mv) { tete += sep_tete + ia_modele_json(provider, mv); sep_tete = "," }
             else { reste += sep_reste + ia_modele_json(provider, mv); sep_reste = "," }
         }
-        i = i + 1
     }
     var out = "[" + tete
     if tete != "" and reste != "" { out += "," }
