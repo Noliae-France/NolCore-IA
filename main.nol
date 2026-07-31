@@ -25,10 +25,30 @@ fn ia_modele_json(provider: Text, model: Text) -> Text {
 // détail — le fournisseur répond, mais pas avec une completion de chat).
 fn ia_modele_est_chat(nom: Text) -> Bool {
     let n = lower(nom)
-    for motif in ["embed","whisper","tts","moderation","image","realtime","transcribe","audio","ocr","dall-e","sora","davinci","babbage","instruct","-tts","vibe-cli"] {
+    for motif in ["embed","whisper","tts","moderation","image","realtime","transcribe","audio","ocr","dall-e","sora","davinci","babbage","instruct","-tts","vibe-cli","preview","codex","search","16k","fim"] {
         if contains(n, motif) { return false }
     }
     return true
+}
+
+// Vrai si le nom contient un segment « -NNN » (3 chiffres consécutifs ou
+// plus) : quasi toujours un instantané daté (-0613, -1106, -2025-08-07),
+// pas un modèle « courant » qu'on veut proposer par défaut. Ça élimine
+// d'un coup toute la longue traîne de snapshots sans avoir à connaître
+// chaque date à l'avance.
+fn ia_modele_instantane_date(nom: Text) -> Bool {
+    let n = len(nom)
+    var i = 0
+    while i < n {
+        if sub(nom,i,1) == "-" {
+            var j = i + 1
+            var chiffres = 0
+            while j < n and contains("0123456789", sub(nom,j,1)) { chiffres = chiffres + 1; j = j + 1 }
+            if chiffres >= 3 { return true }
+        }
+        i = i + 1
+    }
+    return false
 }
 
 // Vrai pour un modèle « par défaut » raisonnable (nom court, sans suffixe de
@@ -83,7 +103,7 @@ fn ia_modeles_provider(provider: Text) -> Text {
         if not has(name) or unwrap_or(name,"") == "" { break }
         var mv = unwrap_or(name,"")
         if provider == "gemini" and starts_with(mv, "models/") { mv = sub(mv, 7, len(mv)) }
-        if ia_modele_est_chat(mv) {
+        if ia_modele_est_chat(mv) and not ia_modele_instantane_date(mv) {
             if ia_modele_prioritaire(provider, mv) { tete += sep_tete + ia_modele_json(provider, mv); sep_tete = "," }
             else { reste += sep_reste + ia_modele_json(provider, mv); sep_reste = "," }
         }
