@@ -10,6 +10,8 @@ fn ia_label(provider: Text) -> Text {
     if provider == "claude" { return "Claude" }
     if provider == "mistral" { return "Mistral" }
     if provider == "gemini" { return "Gemini" }
+    if provider == "grok" { return "Grok" }
+    if provider == "deepseek" { return "DeepSeek" }
     return provider
 }
 
@@ -94,6 +96,8 @@ fn ia_modele_prioritaire(provider: Text, nom: Text) -> Bool {
     if provider == "chatgpt" or provider == "openai" { return contains(nom, "mini") }
     if provider == "mistral" { return nom == "mistral-small-latest" or nom == "mistral-large-latest" or nom == "mistral-medium-latest" }
     if provider == "gemini" { return contains(lower(nom), "flash") }
+    if provider == "grok" { return contains(lower(nom), "mini") or nom == "grok-beta" }
+    if provider == "deepseek" { return nom == "deepseek-chat" }
     return false
 }
 
@@ -121,6 +125,8 @@ fn ia_modeles_provider(provider: Text) -> Text {
     if url == "" and (provider == "chatgpt" or provider == "openai") { url = "https://api.openai.com/v1/models" }
     if url == "" and provider == "mistral" { url = "https://api.mistral.ai/v1/models" }
     if url == "" and provider == "gemini" { url = "https://generativelanguage.googleapis.com/v1beta/models?key=" + token }
+    if url == "" and provider == "grok" { url = "https://api.x.ai/v1/models" }
+    if url == "" and provider == "deepseek" { url = "https://api.deepseek.com/v1/models" }
     if url == "" { return "[]" }
     var auth = token
     if provider == "gemini" { auth = "" }
@@ -179,7 +185,7 @@ fn ia_modeles_provider(provider: Text) -> Text {
 }
 fn ia_modeles(_req: Requete, _p: Map<Text>) -> WebResultat {
     var items = "["; var sep = ""
-    for provider in ["chatgpt","claude","mistral","gemini"] {
+    for provider in ["chatgpt","claude","mistral","gemini","grok","deepseek"] {
         let part = ia_modeles_provider(provider)
         // sub(texte, debut, LONGUEUR) et non (debut, fin) : pour retirer le
         // « [ » de tete et le « ] » de fin d'un tableau de N caracteres, il
@@ -203,6 +209,8 @@ fn ia_run(req: Requete, p: Map<Text>) -> WebResultat {
     if url=="" and (provider=="chatgpt" or provider=="openai") { url="https://api.openai.com/v1/chat/completions" }
     if url=="" and provider=="claude" { url="https://api.anthropic.com/v1/messages" }
     if url=="" and provider=="mistral" { url="https://api.mistral.ai/v1/chat/completions" }
+    if url=="" and provider=="grok" { url="https://api.x.ai/v1/chat/completions" }
+    if url=="" and provider=="deepseek" { url="https://api.deepseek.com/v1/chat/completions" }
     if url=="" and provider=="gemini" { url="https://generativelanguage.googleapis.com/v1beta/models/"+model+":generateContent?key="+token }
     if token=="" { return ia_erreur(503,"Token fournisseur absent",req) }
     var body = "{\"model\":"+json_texte(model)+",\"messages\":[{\"role\":\"user\",\"content\":"+json_texte(text_input)+"}]}"
@@ -340,6 +348,8 @@ fn ia_stream(f: Int, raw: Text) {
     if url == "" and (provider == "chatgpt" or provider == "openai") { url = "https://api.openai.com/v1/chat/completions" }
     if url == "" and provider == "claude" { url = "https://api.anthropic.com/v1/messages" }
     if url == "" and provider == "mistral" { url = "https://api.mistral.ai/v1/chat/completions" }
+    if url == "" and provider == "grok" { url = "https://api.x.ai/v1/chat/completions" }
+    if url == "" and provider == "deepseek" { url = "https://api.deepseek.com/v1/chat/completions" }
     if token == "" {
         let _e = tcp_write(f, "event: error\ndata: {\"error\":\"token fournisseur absent\"}\n\n")
         tcp_close(f); return
