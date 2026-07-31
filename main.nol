@@ -17,8 +17,33 @@ fn ia_modele_json(provider: Text, model: Text) -> Text {
     return "{\"provider\":" + json_texte(provider) + ",\"model\":" + json_texte(model) + ",\"label\":" + json_texte(ia_label(provider)) + "}"
 }
 
+// Faux pour les modèles non conversationnels (embeddings, transcription,
+// synthèse vocale, modération, génération d'image, temps réel...) : les
+// catalogues bruts OpenAI/Mistral les mélangent avec les vrais modèles de
+// chat, et un embeddings/tts choisi par défaut fait échouer /v1/ia
+// silencieusement (« Service IA indisponible » côté client, sans plus de
+// détail — le fournisseur répond, mais pas avec une completion de chat).
+fn ia_modele_est_chat(nom: Text) -> Bool {
+    let n = lower(nom)
+    for motif in ["embed","whisper","tts","moderation","image","realtime","transcribe","audio","ocr","dall-e","sora","davinci","babbage","instruct","-tts","vibe-cli"] {
+        if contains(n, motif) { return false }
+    }
+    return true
+}
+
+// Vrai pour un modèle « par défaut » raisonnable (nom court, sans suffixe de
+// date/version) : place ces entrées en tête de liste, pour que le PREMIER
+// modèle affiché/sélectionné par le front soit toujours utilisable.
+fn ia_modele_prioritaire(provider: Text, nom: Text) -> Bool {
+    if provider == "chatgpt" or provider == "openai" { return nom == "gpt-4o-mini" or nom == "gpt-4o" or nom == "gpt-5-mini" or nom == "gpt-5" }
+    if provider == "mistral" { return nom == "mistral-small-latest" or nom == "mistral-large-latest" or nom == "mistral-medium-latest" }
+    if provider == "gemini" { return contains(lower(nom), "flash") }
+    return false
+}
+
 // Liste les modèles d'UN fournisseur. Vide si le fournisseur n'a pas de token
-// (donc non configuré = non affiché). Sinon, TOUS ses modèles disponibles.
+// (donc non configuré = non affiché). Sinon, ses modèles de CHAT disponibles
+// (voir ia_modele_est_chat), les plus courants en tête (ia_modele_prioritaire).
 fn ia_modeles_provider(provider: Text) -> Text {
     let prefix = "NOLCORE_" + upper(provider)
     let token = unwrap_or(env(prefix + "_TOKEN"),"")
@@ -48,15 +73,25 @@ fn ia_modeles_provider(provider: Text) -> Text {
     let raw = unwrap_or(rep,ReponseHttp {statut:0,entetes:"",corps:""}).corps
     var key = "data"
     if provider == "gemini" { key = "models" }
-    var out = "["; var sep = ""; var i = 0
+    // Deux compartiments : modèles « courants » en tête, le reste ensuite.
+    var tete = ""; var sep_tete = ""
+    var reste = ""; var sep_reste = ""
+    var i = 0
     while i < 200 {
         var name = json_chemin_texte(raw,key + "." + text(i) + ".id")
         if provider == "gemini" { name = json_chemin_texte(raw,key + "." + text(i) + ".name") }
         if not has(name) or unwrap_or(name,"") == "" { break }
         var mv = unwrap_or(name,"")
         if provider == "gemini" and starts_with(mv, "models/") { mv = sub(mv, 7, len(mv)) }
-        out += sep + ia_modele_json(provider, mv); sep = ","; i = i + 1
+        if ia_modele_est_chat(mv) {
+            if ia_modele_prioritaire(provider, mv) { tete += sep_tete + ia_modele_json(provider, mv); sep_tete = "," }
+            else { reste += sep_reste + ia_modele_json(provider, mv); sep_reste = "," }
+        }
+        i = i + 1
     }
+    var out = "[" + tete
+    if tete != "" and reste != "" { out += "," }
+    out += reste
     return out + "]"
 }
 fn ia_modeles(_req: Requete, _p: Map<Text>) -> WebResultat {
